@@ -56,6 +56,9 @@ _MEANINGLESS_NAME = re.compile(r"^(CLP[0-9a-f]{8,}|image\d*|clip(board)?_?\d*|�
 LARGER_RATIO = 1.3
 # 고른 파일이 한글에 든 사진보다 이만큼도 크지 않으면 원본이 아닐 수 있다고 알린다
 ORIGINAL_RATIO = 1.2
+# 좌우로 뒤집어야 맞는 사진은 이 점수를 넘지 않으면 확실로 치지 않는다.
+# 실측상 진짜 원본은 0.99 이상 나온다.
+MIRROR_CERTAIN = 0.97
 
 CERTAIN = "확실"
 REVIEW = "확인필요"
@@ -77,6 +80,7 @@ class Candidate:
     name_match: bool = False
     identical_file: bool = False    # 한글에 든 사진과 바이트까지 같은가
     size_ratio: float = 0.0         # 한글에 든 사진의 몇 배 크기인가
+    exif_conflict: bool = False     # 촬영 시각이 서로 다른가 (다른 사진이라는 뜻)
     refined: bool = False
     notes: List[str] = field(default_factory=list)
 
@@ -94,6 +98,8 @@ class Candidate:
             bits.append("원본 화소 재확인")
         if self.size_ratio:
             bits.append(f"한글 속 사진의 {self.size_ratio:.1f}배 크기")
+        if self.exif_conflict:
+            bits.append("촬영 시각이 다름")
         return " · ".join(bits)
 
 
@@ -103,6 +109,9 @@ class SlotMatch:
     best: Optional[Candidate] = None
     runners_up: List[Candidate] = field(default_factory=list)
     message: str = ""
+    # '확인 필요' 로 내린 까닭. 'margin' 은 '1등과 2등이 붙어서' 라는 뜻이다.
+    # 그 둘이 알고 보니 같은 사진의 다른 판본이었다면 헷갈릴 것이 없어진다.
+    ambiguity: str = ""
 
     @property
     def path(self) -> Optional[str]:
@@ -166,6 +175,23 @@ def _head_sha1_bytes(data: bytes) -> str:
     h.update(str(len(data)).encode())
     h.update(data[:65536])
     return h.hexdigest()
+
+
+def exif_conflict(query: "Query", rec: PhotoRecord) -> bool:
+    """한글 속 사진과 이 후보의 촬영 시각이 서로 다른가.
+
+    둘 다 사진기가 적어 둔 촬영 시각을 갖고 있는데 그 값이 다르면,
+    겉모습이 아무리 닮았어도 다른 사진이다. 풍경 사진끼리는 전혀 다른 곳이라도
+    0.6~0.8 점이 예사로 나오기 때문에, 이 검사가 겉모습보다 훨씬 믿을 만하다.
+    """
+    q = query.exif
+    if not q.taken_at or not rec.taken_at:
+        return False                    # 한쪽이라도 없으면 판단하지 않는다
+    if q.taken_at != rec.taken_at:
+        return True
+    if q.subsec and rec.subsec and q.subsec != rec.subsec:
+        return True                     # 같은 초에 찍힌 다른 사진(연사)
+    return False
 
 
 def same_photo(a: PhotoRecord, b: PhotoRecord) -> bool:
@@ -278,6 +304,7 @@ class Matcher:
         cand.aspect_gap = FP.aspect_gap(fp.aspect, rec.aspect)
 
         cand.chroma_gap = abs(FP.chroma(fp.tile_array()) - FP.chroma(rec.tile_array()))
+        cand.exif_conflict = exif_conflict(query, rec)
 
         ncc_part = max(0.0, cand.ncc)
         dhash_part = max(0.0, 1.0 - cand.dhash_distance / 256.0)
@@ -384,9 +411,16 @@ class Matcher:
                 decision.runners_up = [c for c in pool if c is not biggest][:3]
                 decision.best = biggest
                 chosen = biggest
-                if decision.verdict == REVIEW and not decision.message.startswith("EXIF 는"):
+                # 판정을 올릴 수 있는 경우는 하나뿐이다.
+                # '1등과 2등이 붙어서 헷갈린다' 고 내려놓았는데, 알고 보니 그 둘이
+                # 같은 사진의 큰 판본과 작은 판본이었을 때. 그러면 헷갈릴 것이 없다.
+                # 점수 자체가 낮아서 내려놓은 것은 절대 올리지 않는다 —
+                # 예전에 그것까지 올렸다가 66점짜리 엉뚱한 사진이 확실로 나갔다.
+                if (decision.verdict == REVIEW and decision.ambiguity == "margin"
+                        and biggest.score >= SCORE_CERTAIN):
                     decision.verdict = CERTAIN
                     decision.message = ""
+                    decision.ambiguity = ""
 
         # 고른 것이 한글에 든 사진과 견줘 얼마나 큰지 남긴다
         if query.pixels and chosen.record.width and chosen.record.height:
@@ -455,6 +489,17 @@ class Matcher:
 
         ranked = sorted(pool.values(), key=sort_key, reverse=True)
 
+        # 촬영 시각이 어긋난 후보는 '고를 수 있는 것' 에서 뺀다.
+        # 다만 목록에서 지우지는 않는다 — 겉모습으로는 가장 가까운 것일 수 있고,
+        # 사람이 리포트에서 직접 고를 수 있어야 한다.
+        conflicted = [c for c in ranked if c.exif_conflict]
+        ranked = [c for c in ranked if not c.exif_conflict]
+        if not ranked:
+            return SlotMatch(
+                verdict=NOT_FOUND, runners_up=conflicted[:4],
+                message="촬영 시각이 한글 속 사진과 달라 다른 사진으로 보입니다. "
+                        "리포트에서 후보를 확인해 주세요.")
+
         exif_hits = [c for c in ranked if c.exif_key]
         if exif_hits:
             return self._finish(query, self._decide_with_exif(query, exif_hits, ranked),
@@ -475,22 +520,53 @@ class Matcher:
 
         best = ranked[0]
         margin = best.score - (ranked[1].score if len(ranked) > 1 else 0.0)
+        ambiguity = ""
         if best.score >= SCORE_CERTAIN and margin >= MARGIN_CERTAIN:
             verdict, msg = CERTAIN, ""
         elif best.score >= SCORE_CERTAIN:
             verdict = REVIEW
             msg = f"비슷한 사진이 여럿입니다 (1등 {best.score:.3f}, 2등 {ranked[1].score:.3f})"
+            ambiguity = "margin"
         elif best.score >= SCORE_REVIEW:
             verdict, msg = REVIEW, "닮긴 했지만 확신할 수 없습니다"
         else:
             verdict, msg = NOT_FOUND, "충분히 닮은 사진이 없습니다"
+        rest = list(ranked[1:4])
+        if verdict == NOT_FOUND:
+            rest = (conflicted[:2] + [best] + rest)[:4]
+            # 겉모습으로는 가장 가까운데 촬영 시각 때문에 뺀 것이 있으면
+            # 그 사실을 알려 준다. 그냥 '닮은 게 없다' 보다 훨씬 도움이 된다.
+            if conflicted and conflicted[0].score >= SCORE_REVIEW:
+                msg = ("겉모습이 가장 닮은 사진은 촬영 시각이 달라 다른 사진으로 보입니다. "
+                       "리포트에서 후보를 확인해 주세요.")
         return self._finish(query, SlotMatch(
             verdict=verdict, best=best if verdict != NOT_FOUND else None,
-            runners_up=[c for c in ranked[1:4]], message=msg), allow_same_size)
+            runners_up=rest, message=msg,
+            ambiguity=ambiguity), allow_same_size)
 
     def _finish(self, query: Query, decision: SlotMatch, allow_same_size: bool) -> SlotMatch:
         decision = self._prefer_larger(query, decision)
+        decision = self._veto_wrong_photo(decision)
         return self._warn_if_not_original(query, decision, allow_same_size)
+
+    @staticmethod
+    def _veto_wrong_photo(decision: SlotMatch) -> SlotMatch:
+        """좌우로 뒤집어야 맞는 사진은 확실로 치지 않는다.
+
+        보고서에 사진을 뒤집어 넣는 일은 없다. 뒤집기까지 맞춰 보면
+        엉뚱한 사진이 걸릴 확률이 두 배가 되므로, 아주 높은 점수가 아니면
+        사람이 한 번 봐야 한다.
+        """
+        best = decision.best
+        if best is None:
+            return decision
+
+        if best.orientation == "좌우 반전" and best.score < MIRROR_CERTAIN:
+            if decision.verdict == CERTAIN:
+                decision.verdict = REVIEW
+            decision.message = ((decision.message + " / ") if decision.message else "") + \
+                "좌우를 뒤집어야 맞는 사진입니다. 보통은 다른 사진이라는 뜻입니다."
+        return decision
 
     @staticmethod
     def _collapse_same_photo(candidates: List[Candidate]) -> List[Candidate]:

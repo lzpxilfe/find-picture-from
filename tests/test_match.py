@@ -64,6 +64,14 @@ def test_EXIF_가_같으면_바로_확정한다(tmp_path):
     assert "EXIF" in result.best.reason
 
 
+def _restamp(data: bytes, exif: bytes) -> bytes:
+    """픽셀은 그대로 두고 EXIF 만 바꿔 끼운다."""
+    im = Image.open(io.BytesIO(data))
+    out = io.BytesIO()
+    im.save(out, "JPEG", quality=95, exif=exif)
+    return out.getvalue()
+
+
 def _exif(model, taken, subsec):
     from PIL import Image as _I
     exif = _I.Exif()
@@ -286,3 +294,76 @@ def test_거의_같아_보이는_다른_사진끼리는_갈아타지_않는다(t
 
     result = matcher.match(build_query(shrink(bufs["도면_변경.JPG"], factor=2)))
     assert result.path.endswith("도면_변경.JPG")
+
+
+def test_촬영_시각이_다르면_아무리_닮아도_고르지_않는다(tmp_path):
+    """풍경 사진끼리는 전혀 다른 곳이라도 0.6~0.9 점이 예사로 나온다.
+    사진기가 적어 둔 촬영 시각이 다르면 그게 훨씬 믿을 만한 근거다."""
+    a = _exif("NIKON D5600", "2025:03:26 11:10:19", "")
+    b = _exif("NIKON D5600", "2025:03:26 13:23:05", "")
+    # 겉모습은 사실상 같게 두고 촬영 시각만 다르게 한다.
+    # 그래야 '겉모습이 모자라서' 가 아니라 '촬영 시각 때문에' 걸러졌음이 분명해진다.
+    base = make_jpeg(2400, 1600, seed=71, exif=b)
+    query = shrink(base, keep_exif=False)
+    query = _restamp(query, a)
+    photos = {"DSC_0857.JPG": base}
+    photos.update({f"D{i}.JPG": make_jpeg(2400, 1600, seed=1100 + i) for i in range(6)})
+    matcher, _ = build_index(tmp_path, photos)
+
+    result = matcher.match(build_query(query))
+    assert result.verdict == NOT_FOUND
+    assert "촬영 시각" in result.message
+    # 사람이 리포트에서 고를 수 있도록 후보로는 남는다
+    assert result.runners_up and result.runners_up[0].exif_conflict
+
+
+def test_촬영_시각이_같으면_그대로_고른다(tmp_path):
+    blob = _exif("NIKON D5600", "2025:03:26 11:10:19", "")
+    target = make_jpeg(2400, 1600, seed=72, exif=blob)
+    photos = {"DSC_0857.JPG": target}
+    photos.update({f"D{i}.JPG": make_jpeg(2400, 1600, seed=1200 + i) for i in range(6)})
+    matcher, _ = build_index(tmp_path, photos)
+    result = matcher.match(build_query(shrink(target)))
+    assert result.verdict == CERTAIN and result.path.endswith("DSC_0857.JPG")
+
+
+def test_한쪽에_EXIF_가_없으면_촬영_시각으로_거르지_않는다(tmp_path):
+    """지도·도면처럼 EXIF 가 없는 그림은 겉모습으로만 판단해야 한다."""
+    target = make_jpeg(2400, 1600, seed=73)               # EXIF 없음
+    photos = {"MAP_001.JPG": target}
+    photos.update({f"D{i}.JPG": make_jpeg(2400, 1600, seed=1300 + i) for i in range(6)})
+    matcher, _ = build_index(tmp_path, photos)
+    result = matcher.match(build_query(shrink(target, keep_exif=False)))
+    assert result.verdict == CERTAIN and result.path.endswith("MAP_001.JPG")
+
+
+def test_큰_판본으로_갈아탔다고_판정을_올리지_않는다(tmp_path):
+    """예전에 여기서 66점짜리 엉뚱한 사진이 '확실' 로 나갔다.
+
+    '더 큰 판본으로 갈아탔다' 와 '이 사진이 맞다' 는 다른 이야기다.
+    """
+    from findpic.index import PhotoRecord
+    from findpic.imaging.exif import ExifFingerprint
+    from findpic.match import SCORE_CERTAIN, Candidate, Matcher, Query, SlotMatch
+
+    low = Candidate(record=PhotoRecord(path="/a/small.jpg", width=800, height=600),
+                    score=0.667)
+    big = Candidate(record=PhotoRecord(path="/a/big.jpg", width=6000, height=4000),
+                    score=0.667)
+    assert low.score < SCORE_CERTAIN
+    decision = SlotMatch(verdict=REVIEW, best=low, runners_up=[big],
+                         message="닮긴 했지만 확신할 수 없습니다")
+    out = Matcher._prefer_larger(Query(exif=ExifFingerprint()), decision)
+    assert out.verdict == REVIEW              # 점수가 낮으면 절대 올라가면 안 된다
+    assert out.best is big                    # 갈아타기는 한다
+
+
+def test_좌우를_뒤집어야_맞는_사진은_확실로_치지_않는다(tmp_path):
+    """보고서에 사진을 뒤집어 넣는 일은 없다. 뒤집어야 맞는다면 대개 다른 사진이다."""
+    from findpic.match import Candidate, Matcher, SlotMatch
+    from findpic.index import PhotoRecord
+
+    cand = Candidate(record=PhotoRecord(path="/a/x.jpg", width=6000, height=4000),
+                     score=0.90, orientation="좌우 반전")
+    out = Matcher._veto_wrong_photo(SlotMatch(verdict=CERTAIN, best=cand))
+    assert out.verdict == REVIEW and "뒤집" in out.message

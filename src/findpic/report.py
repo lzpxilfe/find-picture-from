@@ -170,6 +170,22 @@ def _esc(text) -> str:
     return html.escape(str(text or ""))
 
 
+def distinguish(paths) -> dict:
+    """이름이 같은 파일이 섞여 있으면 상위 폴더까지 붙여 구분한다.
+
+    다른 폴더에 같은 이름의 사진이 있는 일이 흔한데, 파일 이름만 보이면
+    후보 두 개가 똑같아 보여 고를 수가 없다.
+    """
+    from collections import Counter
+
+    paths = [Path(p) for p in paths]
+    counts = Counter(p.name for p in paths)
+    out = {}
+    for p in paths:
+        out[str(p)] = f"{p.parent.name} / {p.name}" if counts[p.name] > 1 else p.name
+    return out
+
+
 def human_size(size: int) -> str:
     """1MB 가 안 되는 파일이 '0.0MB' 로 보이지 않게 한다."""
     if size >= 1_048_576:
@@ -287,6 +303,7 @@ def build(reports: Sequence[DocReport], *, title: str = "사진 원본 찾기 �
                 if match.best:
                     options.append((match.best, True))
                 options.extend((alt, False) for alt in match.runners_up[:3])
+                shown = distinguish(alt.record.path for alt, _ in options)
                 for alt, is_current in options:
                     thumb = thumbnail(alt.record.path, 90)
                     img = f"<img src='{thumb}' alt=''>" if thumb else ""
@@ -295,7 +312,7 @@ def build(reports: Sequence[DocReport], *, title: str = "사진 원본 찾기 �
                     parts.append(
                         f"<label><input type='radio' name='{group}'"
                         f" value='{_esc(alt.record.path)}' data-original='{original}'{checked}>"
-                        f"{img}<span>{_esc(Path(alt.record.path).name)}"
+                        f"{img}<span>{_esc(shown.get(alt.record.path, Path(alt.record.path).name))}"
                         f"<span class='why'> · {alt.score * 100:.1f}점</span></span></label>"
                     )
                 parts.append(
