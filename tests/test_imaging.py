@@ -109,3 +109,90 @@ def test_종횡비_차이():
 
 def test_열_수_없는_바이트는_None():
     assert open_image(b"not an image") is None
+
+
+def _jpeg_with_thumbnail(size=(1200, 800), thumb=(160, 106), seed=5, shift=0):
+    """EXIF 축소판(IFD1)이 든 JPEG 을 손으로 만든다.
+
+    Pillow 는 축소판을 써 주지 않으므로 TIFF 구조를 직접 조립한다.
+    """
+    import struct
+
+    body = Image.open(io.BytesIO(make_jpeg(*size, seed=seed))).convert("RGB")
+    small = body.resize(thumb, Image.LANCZOS)
+    if shift:
+        small = Image.eval(small, lambda v: min(255, v + shift))
+    tbuf = io.BytesIO()
+    small.save(tbuf, "JPEG", quality=80)
+    tdata = tbuf.getvalue()
+
+    # TIFF 헤더 + IFD0(PixelXDimension 없이 ImageWidth/Length) + IFD1(축소판)
+    def ifd(entries, next_offset, data_offset):
+        out = struct.pack("<H", len(entries))
+        extra = b""
+        for tag, typ, count, value in entries:
+            out += struct.pack("<HHI", tag, typ, count)
+            out += struct.pack("<I", value)
+        out += struct.pack("<I", next_offset)
+        return out + extra
+
+    header = b"II" + struct.pack("<HI", 42, 8)
+    ifd0_entries = [(0x0100, 4, 1, size[0]), (0x0101, 4, 1, size[1])]
+    ifd0_len = 2 + len(ifd0_entries) * 12 + 4
+    ifd1_off = 8 + ifd0_len
+    ifd1_entries_count = 3
+    ifd1_len = 2 + ifd1_entries_count * 12 + 4
+    thumb_off = ifd1_off + ifd1_len
+    ifd1_entries = [
+        (0x0103, 3, 1, 6),                 # Compression = JPEG
+        (0x0201, 4, 1, thumb_off),
+        (0x0202, 4, 1, len(tdata)),
+    ]
+    tiff = header + ifd(ifd0_entries, ifd1_off, 0) + ifd(ifd1_entries, 0, 0) + tdata
+
+    out = io.BytesIO()
+    # Pillow 는 exif 인자가 "Exif\x00\x00" 로 시작하지 않으면 통째로 버린다
+    body.save(out, "JPEG", quality=90, exif=b"Exif\x00\x00" + tiff)
+    return out.getvalue()
+
+
+def test_EXIF_축소판을_꺼낸다(tmp_path):
+    from findpic.imaging.exif import read_thumbnail
+
+    path = tmp_path / "photo.JPG"
+    path.write_bytes(_jpeg_with_thumbnail())
+    thumb = read_thumbnail(path)
+    assert thumb and thumb[:2] == b"\xff\xd8"
+    with Image.open(io.BytesIO(thumb)) as im:
+        assert im.size == (160, 106)
+
+
+def test_축소판이_없으면_None(tmp_path):
+    path = tmp_path / "plain.JPG"
+    path.write_bytes(make_jpeg(400, 300, seed=1))
+    from findpic.imaging.exif import read_thumbnail
+    assert read_thumbnail(path) is None
+
+
+def test_축소판으로_만든_지문이_본체와_거의_같다(tmp_path):
+    """사진기가 넣어 둔 축소판만 읽어도 같은 사진임을 알아볼 수 있어야 한다."""
+    from findpic.imaging.exif import read_thumbnail
+
+    path = tmp_path / "photo.JPG"
+    path.write_bytes(_jpeg_with_thumbnail(size=(1600, 1067), thumb=(160, 107), seed=9))
+    full = FP.compute(open_image(path))
+    small = FP.compute(open_image(read_thumbnail(path)))
+    assert FP.ncc(full.gray_array(), small.gray_array()) > 0.97
+    assert FP.hamming(full.dhash, small.dhash) < 40
+    assert FP.tile_distance(full.tile_array(), small.tile_array()) < 12
+
+
+def test_축소판을_써도_크기는_진짜_값을_남긴다(tmp_path):
+    """축소 디코딩한 크기를 그대로 저장하면 6000x4000 사진이 750x500 이 된다."""
+    from findpic.index import analyse
+
+    path = tmp_path / "photo.JPG"
+    path.write_bytes(_jpeg_with_thumbnail(size=(1600, 1067), thumb=(160, 107), seed=10))
+    for fast in (False, True):
+        rec = analyse(path, fast=fast)
+        assert (rec.width, rec.height) == (1600, 1067), fast

@@ -23,7 +23,7 @@ import numpy as np
 
 from .imaging import fingerprint as FP
 from .imaging.exif import ExifFingerprint
-from .imaging.loader import open_image
+from .imaging.loader import open_image, real_size
 from .index import PhotoRecord
 
 # --- 판정 기준 ---------------------------------------------------------------
@@ -125,7 +125,7 @@ def build_query(data: bytes, hint=None) -> Query:
     from .imaging.exif import fingerprint_bytes
 
     image = open_image(data, target=FP.GRAY_SIZE * 2)
-    variants = FP.variants(image) if image is not None else []
+    variants = FP.variants(image, true_size=real_size(data)) if image is not None else []
     if image is not None:
         try:
             image.close()

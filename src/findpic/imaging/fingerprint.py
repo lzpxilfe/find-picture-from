@@ -61,10 +61,16 @@ def _bits_to_bytes(bits: np.ndarray) -> bytes:
     return np.packbits(bits.astype(np.uint8).ravel()).tobytes()
 
 
-def compute(image: Image.Image) -> VisualFingerprint:
+def compute(image: Image.Image, *, true_size=None) -> VisualFingerprint:
+    """지문을 만든다.
+
+    true_size 를 주면 그 값을 크기로 기록한다. 빠르게 읽으려고 축소 디코딩한
+    그림을 넘길 때, 지문은 그 그림으로 만들되 크기는 원래 값을 남기기 위한 것이다.
+    (종횡비는 축소해도 유지되므로 비교 자체에는 영향이 없다.)
+    """
     if image is None:
         return VisualFingerprint()
-    w, h = image.size
+    w, h = true_size or image.size
     try:
         rgb = image.convert("RGB")
         gray_im = rgb.convert("L")
@@ -87,18 +93,19 @@ def compute(image: Image.Image) -> VisualFingerprint:
     )
 
 
-def variants(image: Image.Image) -> List[tuple]:
+def variants(image: Image.Image, *, true_size=None) -> List[tuple]:
     """돌리거나 뒤집은 판본들의 지문. (설명, 지문) 목록.
 
     보고서에 넣으면서 사진을 돌려 넣은 경우까지 잡기 위해 **질의 쪽에만**
     적용한다. 원본 수만 장에 대해 전부 만들면 낭비다.
     """
-    out = [("그대로", compute(image))]
+    turned = (true_size[1], true_size[0]) if true_size else None
+    out = [("그대로", compute(image, true_size=true_size))]
     try:
-        out.append(("90도 회전", compute(image.transpose(Image.ROTATE_90))))
-        out.append(("180도 회전", compute(image.transpose(Image.ROTATE_180))))
-        out.append(("270도 회전", compute(image.transpose(Image.ROTATE_270))))
-        out.append(("좌우 반전", compute(image.transpose(Image.FLIP_LEFT_RIGHT))))
+        out.append(("90도 회전", compute(image.transpose(Image.ROTATE_90), true_size=turned)))
+        out.append(("180도 회전", compute(image.transpose(Image.ROTATE_180), true_size=true_size)))
+        out.append(("270도 회전", compute(image.transpose(Image.ROTATE_270), true_size=turned)))
+        out.append(("좌우 반전", compute(image.transpose(Image.FLIP_LEFT_RIGHT), true_size=true_size)))
     except Exception:
         pass
     return [(name, fp) for name, fp in out if fp.ok]

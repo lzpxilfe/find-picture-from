@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -31,6 +32,14 @@ def _setup_console() -> None:
             stream.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
             pass
+
+
+def default_workers() -> int:
+    """동시에 읽을 사진 수.
+
+    실측상 코어 수보다 많이 띄우면 오히려 느려진다(디스크가 아니라 디코딩이 병목).
+    """
+    return max(2, min(8, os.cpu_count() or 4))
 
 
 def say(*args) -> None:
@@ -209,7 +218,8 @@ def cmd_index(args: argparse.Namespace) -> int:
     index = PhotoIndex(_cache_path(args))
     say(f"원본 사진 폴더를 훑습니다: {', '.join(str(s) for s in args.source)}")
     progress = Progress("색인 만드는 중", not args.quiet)
-    stats = index.refresh(args.source, workers=args.workers, progress=progress)
+    stats = index.refresh(args.source, workers=args.workers,
+                          fast=not args.no_fast_index, progress=progress)
     progress.done()
     say(f"  색인 완료: 전체 {stats['전체']:,}장 "
         f"(새로 읽음 {stats['새로 읽음']:,} / 재사용 {stats['재사용']:,} / 실패 {stats['실패']:,})")
@@ -253,7 +263,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     say(f"● 원본 사진 폴더를 훑습니다.")
     index = PhotoIndex(_cache_path(args))
     progress = Progress("색인 만드는 중", not args.quiet)
-    stats = index.refresh(args.source, workers=args.workers, progress=progress)
+    stats = index.refresh(args.source, workers=args.workers,
+                          fast=not args.no_fast_index, progress=progress)
     progress.done()
     say(f"  원본 후보 {stats['전체']:,}장 "
         f"(새로 읽음 {stats['새로 읽음']:,} · 지난 결과 재사용 {stats['재사용']:,})")
@@ -471,7 +482,11 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--no-recursive", action="store_true",
                         help="폴더를 줄 때 하위 폴더까지 뒤지지 않음")
         sp.add_argument("--quiet", "-q", action="store_true", help="진행 표시 끄기")
-        sp.add_argument("--workers", type=int, default=8, help="동시에 읽을 사진 수 (기본 8)")
+        sp.add_argument("--workers", type=int, default=default_workers(),
+                        help=f"동시에 읽을 사진 수 (기본 {default_workers()}, 이 컴퓨터의 코어 수 기준)")
+        sp.add_argument("--no-fast-index", action="store_true",
+                        help="사진기가 넣어 둔 EXIF 축소판을 쓰지 않고 사진 파일 전체를 읽음 "
+                             "(느리지만, 사진을 편집해 축소판이 옛것으로 남은 경우 안전함)")
         sp.add_argument("--cache", help="색인 파일 위치 (기본: 결과 폴더 안 .findpic)")
         sp.add_argument("--include-floating", action="store_true",
                         help="표 밖에 따로 놓인 사진도 대상에 넣기 (표지·로고까지 딸려올 수 있음)")

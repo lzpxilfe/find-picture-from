@@ -19,9 +19,9 @@ import numpy as np
 
 from .imaging import exif as EX
 from .imaging import fingerprint as FP
-from .imaging.loader import open_image
+from .imaging.loader import open_image, real_size
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS photos (
     gps       TEXT,
     unique_id TEXT,
     head_sha1 TEXT,
+    thumbed   INTEGER,
     gray      BLOB,
     tiles     BLOB,
     dhash     BLOB,
@@ -65,6 +66,7 @@ class PhotoRecord:
     gps: str = ""
     unique_id: str = ""
     head_sha1: str = ""
+    thumbed: int = 0            # EXIF 축소판으로 지문을 만들었는가
     gray: bytes = b""
     tiles: bytes = b""
     dhash: bytes = b""
@@ -137,8 +139,17 @@ def _head_sha1(path: Path, size: int) -> str:
     return h.hexdigest()
 
 
-def analyse(path: Path) -> PhotoRecord:
-    """사진 한 장에서 EXIF 와 시각 지문을 뽑는다."""
+# EXIF 축소판의 가로세로 비율이 본체와 이만큼 넘게 다르면 믿지 않는다
+_THUMB_ASPECT_TOLERANCE = 0.03
+
+
+def analyse(path: Path, *, fast: bool = True) -> PhotoRecord:
+    """사진 한 장에서 EXIF 와 시각 지문을 뽑는다.
+
+    fast 면 사진기가 넣어 둔 EXIF 축소판을 먼저 본다. 파일 앞부분만 읽으면
+    되므로 큰 사진 수만 장을 훑을 때 훨씬 빠르다. 축소판이 없거나 본체와
+    가로세로 비율이 어긋나면(잘라 편집한 사진 등) 파일 전체를 읽는다.
+    """
     try:
         st = path.stat()
     except OSError as exc:
@@ -151,7 +162,22 @@ def analyse(path: Path) -> PhotoRecord:
     rec.model, rec.make = fp.model, fp.make
     rec.settings, rec.gps, rec.unique_id = fp.settings, fp.gps, fp.unique_id
 
-    image = open_image(path, target=FP.GRAY_SIZE * 2)
+    image = None
+    if fast and fp.width and fp.height:
+        thumb = EX.read_thumbnail(path)
+        if thumb:
+            candidate = open_image(thumb, target=FP.GRAY_SIZE * 2)
+            if candidate is not None and candidate.height:
+                gap = FP.aspect_gap(candidate.width / candidate.height, fp.width / fp.height)
+                if gap <= _THUMB_ASPECT_TOLERANCE:
+                    image, rec.thumbed = candidate, 1
+                else:
+                    try:
+                        candidate.close()
+                    except Exception:
+                        pass
+    if image is None:
+        image = open_image(path, target=FP.GRAY_SIZE * 2)
     if image is None:
         rec.error = "이미지를 열지 못했습니다"
         if fp.width and fp.height:
@@ -162,7 +188,16 @@ def analyse(path: Path) -> PhotoRecord:
         image.close()
     except Exception:
         pass
-    rec.width, rec.height = visual.width, visual.height
+    # 크기는 반드시 '진짜' 값을 쓴다.
+    # 지문을 만들 때 쓴 그림은 빠르게 읽으려고 축소 디코딩한 것이라,
+    # 그 크기를 그대로 쓰면 6000x4000 사진이 750x500 으로 기록된다.
+    size = real_size(path)
+    if size:
+        rec.width, rec.height = size
+    elif fp.width and fp.height:
+        rec.width, rec.height = fp.width, fp.height
+    else:
+        rec.width, rec.height = visual.width, visual.height
     rec.gray, rec.tiles = visual.gray, visual.tiles
     rec.dhash, rec.phash = visual.dhash, visual.phash
     return rec
@@ -196,6 +231,7 @@ class PhotoIndex:
     # -- 만들기 ---------------------------------------------------------
     def refresh(self, roots: Sequence, *,
                 workers: int = 8,
+                fast: bool = True,
                 progress: Optional[Callable[[int, int, str], None]] = None) -> Dict[str, int]:
         files = list(iter_photo_files(roots))
         total = len(files)
@@ -215,7 +251,8 @@ class PhotoIndex:
                 continue
             todo.append(path)
 
-        stats = {"전체": total, "새로 읽음": 0, "재사용": total - len(todo), "실패": 0}
+        stats = {"전체": total, "새로 읽음": 0, "재사용": total - len(todo),
+                 "실패": 0, "축소판 사용": 0}
 
         # 지워진 파일은 먼저 색인에서 뺀다. 새로 읽을 게 없어도 이건 해야 한다.
         current = {str(p) for p in files}
@@ -232,10 +269,12 @@ class PhotoIndex:
         done = stats["재사용"]
         batch: List[PhotoRecord] = []
         with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-            for rec in pool.map(analyse, todo):
+            for rec in pool.map(lambda p: analyse(p, fast=fast), todo):
                 batch.append(rec)
                 done += 1
                 stats["새로 읽음"] += 1
+                if rec.thumbed:
+                    stats["축소판 사용"] += 1
                 if rec.error:
                     stats["실패"] += 1
                 if progress and done % 25 == 0:
@@ -254,11 +293,11 @@ class PhotoIndex:
         con.executemany(
             """REPLACE INTO photos
                (path,size,mtime,width,height,taken_at,subsec,model,make,settings,gps,
-                unique_id,head_sha1,gray,tiles,dhash,phash,error)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                unique_id,head_sha1,thumbed,gray,tiles,dhash,phash,error)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             [(r.path, r.size, r.mtime, r.width, r.height, r.taken_at, r.subsec, r.model,
-              r.make, r.settings, r.gps, r.unique_id, r.head_sha1, r.gray, r.tiles,
-              r.dhash, r.phash, r.error) for r in records],
+              r.make, r.settings, r.gps, r.unique_id, r.head_sha1, r.thumbed, r.gray,
+              r.tiles, r.dhash, r.phash, r.error) for r in records],
         )
         con.commit()
 
@@ -270,7 +309,7 @@ class PhotoIndex:
         con = self._connect()
         rows = con.execute(
             """SELECT path,size,mtime,width,height,taken_at,subsec,model,make,settings,gps,
-                      unique_id,head_sha1,gray,tiles,dhash,phash,error FROM photos"""
+                      unique_id,head_sha1,thumbed,gray,tiles,dhash,phash,error FROM photos"""
         )
         prefixes = [str(Path(r).resolve()) for r in roots] if roots else None
         out = []

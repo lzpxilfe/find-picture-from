@@ -180,6 +180,73 @@ def _decode_value(raw: bytes, typ: int, num: int, endian: str) -> Any:
     return raw
 
 
+def _thumbnail_from_tiff(win: _Window) -> Optional[bytes]:
+    """TIFF 구조의 두 번째 IFD(IFD1)에 든 축소판 JPEG 을 꺼낸다.
+
+    사진기가 넣어 두는 160x120 안팎의 작은 그림이다. 파일 앞부분 몇십 KB 만
+    읽으면 되므로, 8MB 짜리 사진 수만 장을 훑을 때 이것만으로 지문을 만들면
+    파일 전체를 읽는 것보다 훨씬 빠르다.
+    """
+    head = win.read(0, 8)
+    if len(head) < 8 or head[:2] not in (b"II", b"MM"):
+        return None
+    endian = "<" if head[:2] == b"II" else ">"
+    try:
+        (ifd0,) = struct.unpack_from(endian + "I", head, 4)
+        count_raw = win.read(ifd0, 2)
+        if len(count_raw) < 2:
+            return None
+        (count,) = struct.unpack(endian + "H", count_raw)
+        if count == 0 or count > 4096:
+            return None
+        next_raw = win.read(ifd0 + 2 + count * 12, 4)
+        if len(next_raw) < 4:
+            return None
+        (ifd1,) = struct.unpack(endian + "I", next_raw)
+        if ifd1 <= 0:
+            return None
+        count1_raw = win.read(ifd1, 2)
+        if len(count1_raw) < 2:
+            return None
+        (count1,) = struct.unpack(endian + "H", count1_raw)
+        if count1 == 0 or count1 > 4096:
+            return None
+        entries = win.read(ifd1 + 2, count1 * 12)
+        offset = length = None
+        for i in range(min(count1, len(entries) // 12)):
+            tag, _typ, _num = struct.unpack_from(endian + "HHI", entries, i * 12)
+            (value,) = struct.unpack_from(endian + "I", entries, i * 12 + 8)
+            if tag == 0x0201:          # JPEGInterchangeFormat
+                offset = value
+            elif tag == 0x0202:        # JPEGInterchangeFormatLength
+                length = value
+        if not offset or not length or length > 4_000_000:
+            return None
+        data = win.read(offset, length)
+        return data if data[:2] == b"\xff\xd8" else None
+    except (struct.error, ValueError):
+        return None
+
+
+def read_thumbnail(path) -> Optional[bytes]:
+    """파일 앞부분만 읽어 EXIF 축소판을 꺼낸다. 없으면 None."""
+    path = Path(path)
+    try:
+        with open(path, "rb") as fh:
+            magic = fh.read(4)
+            if magic[:2] == b"\xff\xd8":
+                found = _find_jpeg_exif(fh)
+                if not found:
+                    return None
+                base, length = found
+                return _thumbnail_from_tiff(_Window(fh, base=base, limit=max(length, 0) or None))
+            if magic[:2] in (b"II", b"MM"):
+                return _thumbnail_from_tiff(_Window(fh))
+    except (OSError, struct.error, ValueError):
+        return None
+    return None
+
+
 def _parse_tiff(win: _Window) -> Dict[str, Any]:
     head = win.read(0, 8)
     if len(head) < 8:
