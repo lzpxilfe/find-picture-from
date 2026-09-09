@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "findpic"
+version = "0.1.0"
+description = "한글(HWP/HWPX) 보고서의 표에 들어간 축소 사진을 원본 사진 폴더에서 찾아 이름을 붙여 정리하는 도구"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = [
+    "olefile>=0.46",
+    "Pillow>=9.0",
+    "numpy>=1.21",
+]
+
+[project.optional-dependencies]
+heic = ["pillow-heif>=0.13"]
+dev = ["pytest>=7"]
+
+[project.scripts]
+findpic = "findpic.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+findpic = ["assets/*"]
