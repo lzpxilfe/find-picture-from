@@ -170,6 +170,15 @@ def _esc(text) -> str:
     return html.escape(str(text or ""))
 
 
+def human_size(size: int) -> str:
+    """1MB 가 안 되는 파일이 '0.0MB' 로 보이지 않게 한다."""
+    if size >= 1_048_576:
+        return f"{size / 1_048_576:.1f}MB"
+    if size >= 1024:
+        return f"{size / 1024:,.0f}KB"
+    return f"{size}B"
+
+
 def build(reports: Sequence[DocReport], *, title: str = "사진 원본 찾기 결과",
           thumbs: str = "auto") -> str:
     """thumbs: 'all' 전부 / 'attention' 확인 필요한 것만 / 'auto' 문서 수를 보고 결정."""
@@ -249,7 +258,7 @@ def build(reports: Sequence[DocReport], *, title: str = "사진 원본 찾기 �
                     ratio_txt = (f" · <b style='color:{tone}'>한글 속 사진의 "
                                  f"{ratio:.1f}배</b>")
                 parts.append(
-                    f"<div class='meta'>{r.width}×{r.height} · {r.size/1_048_576:.1f}MB"
+                    f"<div class='meta'>{r.width}×{r.height} · {human_size(r.size)}"
                     + ratio_txt
                     + (f" · {_esc(r.model)}" if r.model else "")
                     + (f" · {_esc(r.taken_at)}" if r.taken_at else "")
