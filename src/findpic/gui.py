@@ -129,12 +129,16 @@ class App:
         ttk.Checkbutton(opts, text="표 밖에 따로 놓인 사진도 대상에 넣기 (표지·로고까지 딸려올 수 있음)",
                         variable=self.floating_var).grid(row=2, column=0, columnspan=3, sticky="w",
                                                          padx=10, pady=2)
+        self.overwrite_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(opts, text="이미 있는 파일 덮어쓰기 (다시 돌려 고쳐 넣을 때 켜세요)",
+                        variable=self.overwrite_var).grid(row=3, column=0, columnspan=3, sticky="w",
+                                                          padx=10, pady=2)
 
-        ttk.Label(opts, text="원본을 못 찾으면").grid(row=3, column=0, sticky="w", padx=10, pady=(6, 12))
+        ttk.Label(opts, text="원본을 못 찾으면").grid(row=4, column=0, sticky="w", padx=10, pady=(6, 12))
         self.lowres_var = tk.StringVar(value=LOWRES_CHOICES[0][0])
         combo = ttk.Combobox(opts, textvariable=self.lowres_var, state="readonly",
                              values=[label for label, _ in LOWRES_CHOICES], width=32)
-        combo.grid(row=3, column=1, sticky="w", padx=6, pady=(6, 12))
+        combo.grid(row=4, column=1, sticky="w", padx=6, pady=(6, 12))
 
         # 진행
         run = ttk.Frame(outer)
@@ -270,6 +274,7 @@ class App:
             "hwp": [hwp], "source": sources, "dest": dest,
             "lowres": lowres, "dry_run": self.dry_var.get(),
             "strict": self.strict_var.get(), "include_floating": self.floating_var.get(),
+            "overwrite": self.overwrite_var.get(),
         }
         self.worker = threading.Thread(target=self._work, args=(params,), daemon=True)
         self.worker.start()

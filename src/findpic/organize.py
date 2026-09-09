@@ -219,7 +219,12 @@ def place(doc: HwpDocument,
 
         target_dir.mkdir(parents=True, exist_ok=True)
         target = target_dir / f"{stem}{suffix}"
-        if target.exists() and not overwrite:
+        if overwrite:
+            # 지난번에 확장자가 다른 채로 넣어 둔 같은 이름 파일을 치운다.
+            # 그러지 않으면 '항공사진.jpg'(옛 사본)와 '항공사진.JPG'(새 원본)가
+            # 둘 다 남아, 어느 쪽이 원본인지 알 수 없게 된다.
+            _clear_same_stem(target_dir, stem, keep=target, source=rec.source)
+        elif target.exists():
             target = unique_path(target_dir, stem, suffix)
         rec.target = target
         try:
@@ -271,6 +276,35 @@ def state_entry(doc: HwpDocument, folder: Path, placed: Sequence[PlacedFile]) ->
             for rec in placed
         ],
     }
+
+
+def _clear_same_stem(directory: Path, stem: str, *, keep: Path, source: str = "") -> None:
+    """이름(확장자 뺀 부분)이 같은 옛 파일을 지운다. 덮어쓰기를 켰을 때만 부른다."""
+    want = unicodedata.normalize("NFC", stem).casefold()
+    try:
+        entries = list(directory.iterdir())
+    except OSError:
+        return
+    source_resolved = None
+    if source:
+        try:
+            source_resolved = Path(source).resolve()
+        except OSError:
+            source_resolved = None
+    for path in entries:
+        if not path.is_file():
+            continue
+        if unicodedata.normalize("NFC", path.stem).casefold() != want:
+            continue
+        try:
+            if path.resolve() == keep.resolve() or path.resolve() == source_resolved:
+                continue        # 원본 사진은 절대 건드리지 않는다
+        except OSError:
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            pass
 
 
 def write_csv(path: Path, rows: Sequence[tuple]) -> None:

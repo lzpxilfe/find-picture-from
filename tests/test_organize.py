@@ -209,3 +209,52 @@ def test_연번이_많아도_서로_다른_폴더로_간다(tmp_path):
         if choice.created:
             existing.append(choice.path)
     assert len(seen) == 20
+
+
+def test_덮어쓰기는_확장자가_달라진_옛_파일도_치운다(tmp_path):
+    """다시 돌려 고쳐 넣을 때 '항공사진.jpg'(옛 사본)와 '항공사진.JPG'(새 원본)가
+    둘 다 남으면 어느 쪽이 원본인지 알 수 없다."""
+    from findpic.match import SlotMatch
+
+    folder = tmp_path / "정리" / "대전_026"
+    folder.mkdir(parents=True)
+    (folder / "전경.jpg").write_bytes(b"old small copy")
+
+    originals = tmp_path / "originals"
+    originals.mkdir()
+    big = originals / "DSC_0001.JPG"
+    big.write_bytes(make_jpeg(1600, 1200, seed=3))
+
+    doc = make_doc(tmp_path, captions=("전경",))
+    from findpic.index import PhotoIndex
+    index = PhotoIndex(tmp_path / "idx.sqlite3")
+    index.refresh([originals], workers=2)
+    rec = index.load_all()[0]
+    from findpic.match import Candidate
+    match = SlotMatch(verdict=CERTAIN, best=Candidate(record=rec, score=0.99))
+
+    placed = place(doc, [match], folder, overwrite=True)
+    assert placed[0].target.name == "전경.JPG"
+    names = sorted(p.name for p in folder.iterdir())
+    assert names == ["전경.JPG"]                    # 옛 .jpg 는 사라져야 한다
+    assert big.exists()                             # 원본은 그대로
+
+
+def test_덮어쓰기를_켜도_원본_사진은_지우지_않는다(tmp_path):
+    """원본 폴더와 결과 폴더가 같은 곳일 때도 원본을 지우면 안 된다."""
+    from findpic.index import PhotoIndex
+    from findpic.match import Candidate, SlotMatch
+
+    folder = tmp_path / "한곳"
+    folder.mkdir()
+    original = folder / "전경.JPG"
+    original.write_bytes(make_jpeg(1600, 1200, seed=4))
+
+    index = PhotoIndex(tmp_path / "idx.sqlite3")
+    index.refresh([folder], workers=2)
+    rec = index.load_all()[0]
+
+    doc = make_doc(tmp_path, captions=("전경",))
+    match = SlotMatch(verdict=CERTAIN, best=Candidate(record=rec, score=0.99))
+    place(doc, [match], folder, overwrite=True)
+    assert original.exists() and original.stat().st_size > 0
