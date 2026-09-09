@@ -17,9 +17,23 @@ _RESERVED = {
 MAX_STEM_BYTES = 150        # 경로 길이 여유를 두고 넉넉히 자른다
 
 
+def _drop_lone_surrogates(text: str) -> str:
+    """짝이 풀린 반쪽 문자를 뺀다.
+
+    제대로 읽었다면 나올 일이 없지만, 하나라도 남으면 파일 이름으로 쓰는 순간
+    UnicodeEncodeError 로 작업 전체가 멈춘다. 마지막 안전망이다.
+    """
+    try:
+        text.encode("utf-8")
+        return text
+    except UnicodeEncodeError:
+        return "".join(ch for ch in text if not 0xD800 <= ord(ch) <= 0xDFFF)
+
+
 def sanitize(name: str, *, fallback: str = "이름없음") -> str:
     """어느 운영체제에서도 안전한 파일 이름 조각으로 다듬는다."""
-    name = unicodedata.normalize("NFC", name or "")
+    name = _drop_lone_surrogates(name or "")
+    name = unicodedata.normalize("NFC", name)
     name = name.replace("\n", " ").replace("\t", " ")
     name = _FORBIDDEN.sub("", name)
     name = re.sub(r"\s+", " ", name).strip()

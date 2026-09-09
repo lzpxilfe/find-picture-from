@@ -207,3 +207,90 @@ def test_색_셋_이상인_그러데이션도_읽는다():
     ))
     assert info.image_bin_id_for_border_fill(1) == 4
     assert not info.warnings
+
+
+def test_BMP_밖_글자가_반쪽으로_깨지지_않는다():
+    """확장 한자 같은 글자는 UTF-16 에서 두 칸을 쓴다.
+
+    한 칸씩 chr() 로 만들면 짝이 풀려, 파일 이름으로 쓰는 순간
+    UnicodeEncodeError 로 작업 전체가 멈춘다.
+    """
+    from findpic.naming import sanitize
+
+    payload = "𠮷石窟 전경".encode("utf-16le") + struct.pack("<H", 13)
+    text = decode_para_text(payload)
+    assert text.strip() == "𠮷石窟 전경"
+    text.encode("utf-8")                       # 여기서 터지면 안 된다
+    assert sanitize(text) == "𠮷石窟 전경"
+
+
+def test_반쪽_문자가_섞여_들어와도_파일_이름을_만든다():
+    from findpic.naming import number_captions, sanitize
+
+    broken = "\ud842" + "전경"
+    assert sanitize(broken) == "전경"
+    assert number_captions([broken, broken]) == ["전경(1)", "전경(2)"]
+
+
+def test_글상자_안의_표도_셀을_읽는다():
+    """글상자(gso) 안에 표가 든 문서가 흔하다. 표가 통째로 사라지면 안 된다."""
+    from conftest import para_text, record
+    from findpic.hwp import tags as T
+
+    section = record(T.PARA_HEADER, 0, b"\x00" * 24)
+    section += record(T.CTRL_HEADER, 1, ctrl_header("gso "))       # 글상자
+    section += record(T.SHAPE_COMPONENT, 2, b"\x00" * 40)
+    section += record(T.LIST_HEADER, 2, b"\x00" * 30)              # 글상자 자신의 목록
+    section += record(T.PARA_HEADER, 2, b"\x00" * 24)
+    section += record(T.PARA_TEXT, 3, para_text("글상자 안내문"))
+    section += record(T.CTRL_HEADER, 3, ctrl_header("tbl "))       # 그 안의 표
+    section += record(T.TABLE, 4, b"\x00" * 44)
+    section += record(T.LIST_HEADER, 4, cell_record(col=0, row=0))
+    section += record(T.PARA_HEADER, 4, b"\x00" * 24)
+    section += record(T.PARA_TEXT, 5, para_text("전경"))
+
+    result = parse_section(section, section_index=0, max_bin=1)
+    assert len(result.tables) == 1
+    assert len(result.tables[0].cells) == 1
+    assert result.tables[0].cells[0].text == "전경"
+    # 글상자 자신의 글은 셀 글도 본문도 아니다
+    assert result.body_text == []
+
+
+def test_겹친_글상자에서_바깥_상태가_먼저_풀리지_않는다():
+    from conftest import para_text, record
+    from findpic.hwp import tags as T
+
+    section = record(T.PARA_HEADER, 0, b"\x00" * 24)
+    section += record(T.CTRL_HEADER, 1, ctrl_header("gso "))       # 바깥 글상자
+    section += record(T.SHAPE_COMPONENT, 2, b"\x00" * 40)
+    section += record(T.CTRL_HEADER, 4, ctrl_header("gso "))       # 안쪽 글상자
+    section += record(T.SHAPE_COMPONENT, 5, b"\x00" * 40)
+    section += record(T.PARA_HEADER, 3, b"\x00" * 24)              # 아직 바깥 글상자 안이다
+    section += record(T.PARA_TEXT, 4, para_text("도장 문구"))
+
+    result = parse_section(section, section_index=0, max_bin=1)
+    assert result.body_text == []          # 본문으로 새면 안 된다
+
+
+def test_압축을_푼_결과를_버리지_않는다():
+    """서명 목록에 없는 형식이어도 압축본을 그대로 돌려주면 안 된다."""
+    import zlib
+
+    from findpic.hwp.docinfo import COMPRESS_ALWAYS, BinDataEntry
+    from findpic.hwp.extract import _decode_bin
+
+    payload = b"ftypheic" + b"\x00" * 5000        # 아는 서명이 아닌 형식
+    packed = zlib.compressobj(9, zlib.DEFLATED, -15)
+    raw = packed.compress(payload) + packed.flush()
+    entry = BinDataEntry(index=1, compress=COMPRESS_ALWAYS)
+    assert _decode_bin(raw, entry, True) == payload
+
+
+def test_압축_안_한_JPEG_은_그대로_돌려준다():
+    from findpic.hwp.docinfo import COMPRESS_NEVER, BinDataEntry
+    from findpic.hwp.extract import _decode_bin
+
+    raw = b"\xff\xd8\xff\xe0" + b"\x00" * 200
+    entry = BinDataEntry(index=1, compress=COMPRESS_NEVER)
+    assert _decode_bin(raw, entry, True) == raw

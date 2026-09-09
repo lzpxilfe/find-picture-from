@@ -98,23 +98,40 @@ def find_shape_description(payload: bytes) -> str:
 
 
 def decode_para_text(payload: bytes) -> str:
-    """PARA_TEXT 레코드를 사람이 읽는 문자열로. 제어 문자는 건너뛴다."""
+    """PARA_TEXT 레코드를 사람이 읽는 문자열로. 제어 문자는 건너뛴다.
+
+    글자 하나하나를 chr() 로 만들면 안 된다. 한글이 쓰는 UTF-16 에서 U+FFFF 를
+    넘는 글자(확장 한자, 한컴 보충 문자)는 두 코드 단위가 짝을 이루는데,
+    하나씩 chr() 하면 짝이 풀린 반쪽 문자가 된다. 그런 문자열은 파일 이름으로
+    쓰려는 순간 UnicodeEncodeError 로 작업 전체를 멈춘다.
+    그래서 제어 문자가 아닌 구간은 바이트로 모아 한꺼번에 UTF-16LE 로 되돌린다.
+    """
     out = []
+    run = bytearray()
+
+    def flush():
+        if run:
+            out.append(bytes(run).decode("utf-16le", "replace"))
+            run.clear()
+
     i = 0
     n = len(payload) - 1
     while i < n:
         (code,) = struct.unpack_from("<H", payload, i)
         if code in EXTENDED_CONTROLS or code in INLINE_CONTROLS:
+            flush()
             if code == 9:      # 탭
                 out.append("\t")
             i += WIDE_CONTROL_BYTES
         elif code in CHAR_CONTROLS:
+            flush()
             if code in (10, 13):
                 out.append("\n")
             i += 2
         else:
-            out.append(chr(code))
+            run += payload[i:i + 2]
             i += 2
+    flush()
     return "".join(out)
 
 
@@ -174,21 +191,34 @@ def parse_section(buf: bytes, *, section_index: int, max_bin: int) -> SectionRes
     result = SectionResult()
     stack: List[_OpenTable] = []
     table_order = 0
-    # 그림 개체(gso) 안으로 들어간 상태인지 — 들어간 시점의 level 을 기억한다
-    gso_level: Optional[int] = None
-    gso_hint: Optional[PictureHint] = None
+    # 그리기 개체(글상자·그림)는 겹쳐 들어갈 수 있으므로 스택으로 들고 있는다.
+    # 정수 하나로 두면 안쪽 개체가 닫힐 때 바깥 개체까지 닫힌 것으로 오인한다.
+    gso_levels: List[int] = []
+    gso_hints: List[Optional[PictureHint]] = []
     para_index = 0
 
     def current_cell() -> Optional[Cell]:
         return stack[-1].cell if stack else None
 
+    def inside_table_body() -> bool:
+        """지금 자리가 '표의 셀 안' 인가.
+
+        글상자 안에 표가 들어 있는 경우가 흔하다. 그때 표의 셀까지 글상자로 보고
+        버리면 표가 통째로 사라진다. 그래서 '글상자 안인가' 가 아니라
+        '가장 안쪽에 열린 것이 표인가' 로 판정한다.
+        """
+        if not stack:
+            return False
+        innermost_gso = gso_levels[-1] if gso_levels else -1
+        return innermost_gso < stack[-1].ctrl_level
+
     for rec in iter_records(buf):
         # 열려 있던 표보다 얕은 곳으로 나왔으면 그 표는 끝난 것이다
         while stack and rec.level <= stack[-1].ctrl_level:
             stack.pop()
-        if gso_level is not None and rec.level <= gso_level:
-            gso_level = None
-            gso_hint = None
+        while gso_levels and rec.level <= gso_levels[-1]:
+            gso_levels.pop()
+            gso_hints.pop()
 
         if rec.tag == T.CTRL_HEADER:
             ctrl_id = Reader(rec.payload).signature()
@@ -198,8 +228,8 @@ def parse_section(buf: bytes, *, section_index: int, max_bin: int) -> SectionRes
                 stack.append(_OpenTable(ctrl_level=rec.level, table=table))
                 result.tables.append(table)
             elif ctrl_id == "gso ":
-                gso_level = rec.level
-                gso_hint = parse_picture_hint(find_shape_description(rec.payload))
+                gso_levels.append(rec.level)
+                gso_hints.append(parse_picture_hint(find_shape_description(rec.payload)))
 
         elif rec.tag == T.TABLE and stack:
             rows, cols = _parse_table_head(rec.payload)
@@ -208,8 +238,8 @@ def parse_section(buf: bytes, *, section_index: int, max_bin: int) -> SectionRes
 
         elif rec.tag == T.LIST_HEADER:
             # 표 셀의 LIST_HEADER 는 그 표의 CTRL_HEADER 바로 아래 층에 온다.
-            # 글상자/각주 등 다른 LIST_HEADER 와 이것으로 구분한다.
-            if stack and rec.level == stack[-1].ctrl_level + 1 and gso_level is None:
+            # 글상자·각주 등 다른 LIST_HEADER 와 이것으로 구분한다.
+            if stack and rec.level == stack[-1].ctrl_level + 1 and inside_table_body():
                 cell = _parse_cell(rec.payload)
                 if cell is not None:
                     stack[-1].table.cells.append(cell)
@@ -220,15 +250,15 @@ def parse_section(buf: bytes, *, section_index: int, max_bin: int) -> SectionRes
 
         elif rec.tag == T.PARA_TEXT:
             cell = current_cell()
-            if gso_level is not None:
-                pass                        # 그리기 개체 안의 글은 셀 글이 아니다
-            elif cell is not None:
+            if cell is not None and inside_table_body():
                 # 문단 끝 표시가 줄바꿈으로 남으므로 문단 단위로 다듬어 붙인다.
                 # 여러 문단이 있으면 줄바꿈으로 이어 두고, 나중에 캡션 판단에서
                 # '줄이 여럿이면 캡션이 아니다' 로 쓴다.
                 text = decode_para_text(rec.payload).strip()
                 if text:
                     cell.text = (cell.text + "\n" + text) if cell.text else text
+            elif gso_levels:
+                pass                        # 글상자 안의 글은 본문도 셀 글도 아니다
             else:
                 text = decode_para_text(rec.payload).strip()
                 if text:
@@ -239,8 +269,10 @@ def parse_section(buf: bytes, *, section_index: int, max_bin: int) -> SectionRes
             if bin_id is None:
                 result.warnings.append("그림 개체에서 BinData 번호를 읽지 못했습니다")
                 continue
-            if gso_hint is not None:
-                result.hints.setdefault(bin_id, gso_hint)
+            hint = next((h for h in reversed(gso_hints) if h is not None), None)
+            if hint is not None:
+                result.hints.setdefault(bin_id, hint)
+            # 그림은 글상자에 담겨 있어도 그 글상자가 놓인 셀의 사진으로 본다
             cell = current_cell()
             if cell is not None:
                 cell.inline_bin_ids.append(bin_id)

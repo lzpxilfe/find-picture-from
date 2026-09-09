@@ -159,6 +159,29 @@ def _run_text(node) -> str:
     return "".join(parts)
 
 
+def _own_cells(tbl):
+    """표가 직접 가진 셀만. 셀 안에 든 표의 셀은 그 표가 따로 맡는다.
+
+    node.iter() 로 훑으면 중첩 표의 셀까지 바깥 표 목록에 딸려 들어온다.
+    그러면 같은 (행, 열)이 여러 번 나오고, 캡션이 뒤바뀌거나 한 사진이
+    두 번 잡힌다. 실제 문서 다발에서 334군데에 이 일이 일어났다.
+    """
+    out = []
+
+    def walk(node):
+        for child in node:
+            name = _local(child.tag)
+            if name == "tbl":
+                continue                # 중첩 표는 그 표의 차례에 처리된다
+            if name == "tc":
+                out.append(child)
+                continue                # 셀 속으로는 내려가지 않는다
+            walk(child)
+
+    walk(tbl)
+    return out
+
+
 def _cell_text(tc) -> str:
     """셀의 글. 셀 안에 또 표가 있으면 그 안쪽은 세지 않는다."""
     lines: List[str] = []
@@ -264,7 +287,7 @@ def extract_hwpx(path, *, min_edge: Optional[int] = None,
                 table = Table(section=si, order=order,
                               row_count=_int(tbl.get("rowCnt")),
                               col_count=_int(tbl.get("colCnt")))
-                for tc in _iter_local(tbl, "tc"):
+                for tc in _own_cells(tbl):
                     addr = _find_local(tc, "cellAddr")
                     span = _find_local(tc, "cellSpan")
                     bf_ref = tc.get("borderFillIDRef") or ""

@@ -162,3 +162,49 @@ def test_번호_벗기기가_멀쩡한_글을_자르지_않는다():
     assert clean_caption("55세 이상 기간제 근로자", strip_numbering=True) == "55세 이상 기간제 근로자"
     assert clean_caption("2구역 전경", strip_numbering=True) == "2구역 전경"
     assert clean_caption("[1] 전경", strip_numbering=True) == "전경"
+
+
+def test_HWPX_중첩_표의_셀이_바깥_표에_섞이지_않는다(tmp_path):
+    """셀 안에 표가 있으면 안쪽 셀이 바깥 표 목록에도 들어가, 같은 (행,열)이
+    여러 번 나오고 캡션이 뒤바뀐다. 실제 문서 다발에서 334군데에 있었다."""
+    import zipfile
+
+    from findpic.hwp.hwpx import extract_hwpx
+
+    NS = ('xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph" '
+          'xmlns:hc="http://www.hancom.co.kr/hwpml/2011/core" '
+          'xmlns:hh="http://www.hancom.co.kr/hwpml/2011/head"')
+
+    def tc(row, col, text, inner=""):
+        return (f'<hp:tc><hp:subList><hp:p><hp:run><hp:t>{text}</hp:t>{inner}'
+                f'</hp:run></hp:p></hp:subList>'
+                f'<hp:cellAddr colAddr="{col}" rowAddr="{row}"/>'
+                f'<hp:cellSpan colSpan="1" rowSpan="1"/></hp:tc>')
+
+    inner_table = ('<hp:tbl rowCnt="1" colCnt="1"><hp:tr>'
+                   + tc(0, 0, "안쪽") + '</hp:tr></hp:tbl>')
+    section = (f'<hp:sec {NS}><hp:p><hp:run>'
+               '<hp:tbl rowCnt="1" colCnt="2"><hp:tr>'
+               + tc(0, 0, "바깥1", inner_table) + tc(0, 1, "바깥2")
+               + '</hp:tr></hp:tbl></hp:run></hp:p></hp:sec>')
+    manifest = (f'<opf:package xmlns:opf="http://www.idpf.org/2007/opf/"><opf:manifest>'
+                '<opf:item id="section0" href="Contents/section0.xml"/>'
+                '</opf:manifest></opf:package>')
+
+    path = tmp_path / "중첩.hwpx"
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("mimetype", "application/hwp+zip")
+        z.writestr("META-INF/manifest.xml", "<manifest/>")
+        z.writestr("Contents/content.hpf", manifest)
+        z.writestr("Contents/header.xml", f"<hh:head {NS}/>")
+        z.writestr("Contents/section0.xml", section)
+
+    doc = extract_hwpx(path)
+    assert len(doc.tables) == 2                       # 바깥 표, 안쪽 표
+    outer = next(t for t in doc.tables if len(t.cells) == 2)
+    inner = next(t for t in doc.tables if len(t.cells) == 1)
+    assert sorted(c.text for c in outer.cells) == ["바깥1", "바깥2"]
+    assert inner.cells[0].text == "안쪽"
+    # 같은 (행, 열)이 두 번 나오면 안 된다
+    keys = [(c.row, c.col) for c in outer.cells]
+    assert len(keys) == len(set(keys))

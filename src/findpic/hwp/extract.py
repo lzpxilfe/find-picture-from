@@ -52,28 +52,36 @@ def is_photo_like(item: BinItem, *, min_edge: int = MIN_EDGE,
 
 
 def _decode_bin(raw: bytes, entry: DI.BinDataEntry, file_compressed: bool) -> bytes:
-    """BIN_DATA 의 압축 방침에 따라 풀어 준다. 방침이 틀려도 결과로 판정한다."""
+    """BIN_DATA 의 압축 방침에 따라 풀어 준다. 방침이 틀려도 결과로 판정한다.
+
+    아는 이미지 서명이 나오면 그것으로 확정한다. 아무 것도 안 맞으면
+    **방침이 가리키는 쪽**을 쓴다. 압축을 푼 결과를 얻어 놓고도 압축본을
+    돌려주면, 서명 목록에 없는 형식(HEIC 등)이 조용히 깨진 채로 나간다.
+    """
     if entry.compress == DI.COMPRESS_ALWAYS:
         order = (True, False)
     elif entry.compress == DI.COMPRESS_NEVER:
         order = (False, True)
     else:
         order = (file_compressed, not file_compressed)
-    best = raw
+
+    fallback = None
     for want_inflate in order:
-        if not want_inflate:
+        if want_inflate:
+            try:
+                out = _inflate(raw)
+            except HwpError:
+                continue
+            if _looks_like_image(out):
+                return out
+            if fallback is None and out:
+                fallback = out
+        else:
             if _looks_like_image(raw):
                 return raw
-            best = raw
-            continue
-        try:
-            out = _inflate(raw)
-        except HwpError:
-            continue
-        if _looks_like_image(out):
-            return out
-        best = out or best
-    return best
+            if fallback is None:
+                fallback = raw
+    return fallback if fallback is not None else raw
 
 
 def extract_hwp5(path, *, min_edge: int = MIN_EDGE, min_pixels: int = MIN_PIXELS,
