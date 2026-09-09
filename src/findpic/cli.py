@@ -220,6 +220,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         flat=args.flat, strict=args.strict, allow_duplicate=args.allow_duplicate,
         overwrite=args.overwrite, dry_run=args.dry_run,
         create_missing=not args.no_create_missing,
+        allow_same_size=args.allow_same_size,
         include_floating=args.include_floating, recursive=not args.no_recursive,
         workers=args.workers, fast_index=not args.no_fast_index,
         make_report=not args.no_report, report_path=args.report, thumbs=args.thumbs,
@@ -473,6 +474,9 @@ def _run_options(sp) -> None:
                          "subdir=_저용량 폴더에 / skip=넣지 않음")
     sp.add_argument("--strict", action="store_true",
                     help="'확인 필요' 는 원본으로 치지 않기")
+    sp.add_argument("--allow-same-size", action="store_true",
+                    help="한글에 든 사진과 크기가 비슷한 파일도 원본으로 인정 "
+                         "(기본은 '줄인 사본일 수 있다' 고 알림)")
     sp.add_argument("--allow-duplicate", action="store_true",
                     help="한 원본이 여러 사진에 겹쳐 쓰이는 것을 허용")
     sp.add_argument("--overwrite", action="store_true", help="같은 이름 파일 덮어쓰기")

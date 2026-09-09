@@ -242,8 +242,15 @@ def build(reports: Sequence[DocReport], *, title: str = "사진 원본 찾기 �
                 if right:
                     parts.append(f"<img class='shot' src='{right}' alt=''>")
                 r = match.best.record
+                ratio = match.best.size_ratio
+                ratio_txt = ""
+                if ratio:
+                    tone = "#0a7d3f" if ratio >= 1.2 else "#b02020"
+                    ratio_txt = (f" · <b style='color:{tone}'>한글 속 사진의 "
+                                 f"{ratio:.1f}배</b>")
                 parts.append(
                     f"<div class='meta'>{r.width}×{r.height} · {r.size/1_048_576:.1f}MB"
+                    + ratio_txt
                     + (f" · {_esc(r.model)}" if r.model else "")
                     + (f" · {_esc(r.taken_at)}" if r.taken_at else "")
                     + "</div>"

@@ -81,6 +81,7 @@ class JobConfig:
     recursive: bool = True
     workers: int = 0
     fast_index: bool = True
+    allow_same_size: bool = False   # 한글 속 사진과 크기가 같은 것도 원본으로 인정할지
     make_report: bool = True
     report_path: Optional[str] = None
     thumbs: str = "auto"
@@ -222,7 +223,8 @@ def run_job(config: JobConfig,
                                              message="문서에서 사진 자료를 꺼내지 못했습니다"))
                 else:
                     matches.append(matcher.match(
-                        build_query(item.data, doc.hints.get(slot.bin_id))))
+                        build_query(item.data, doc.hints.get(slot.bin_id)),
+                        allow_same_size=config.allow_same_size))
                 done += 1
                 tick("대조 중", done, slots_total, slot.caption or doc.path.name)
             if not config.allow_duplicate:

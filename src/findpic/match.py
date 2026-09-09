@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
@@ -50,6 +51,12 @@ REFINE_LOCAL_SCALE = 120.0
 # 붙여넣기로 들어간 그림은 'CLP00001d1c371e.bmp' 같은 임시 이름을 남긴다. 단서가 못 된다.
 _MEANINGLESS_NAME = re.compile(r"^(CLP[0-9a-f]{8,}|image\d*|clip(board)?_?\d*|무제|untitled)$", re.I)
 
+# 같은 사진의 여러 판본 중 이만큼 크면 '더 큰 원본' 으로 보고 갈아탄다.
+# 같은 크기끼리는 갈아타지 않는다 — 거의 똑같아 보이는 다른 사진일 수 있다.
+LARGER_RATIO = 1.3
+# 고른 파일이 한글에 든 사진보다 이만큼도 크지 않으면 원본이 아닐 수 있다고 알린다
+ORIGINAL_RATIO = 1.2
+
 CERTAIN = "확실"
 REVIEW = "확인필요"
 NOT_FOUND = "못찾음"
@@ -68,6 +75,8 @@ class Candidate:
     chroma_gap: float = 0.0
     orientation: str = "그대로"
     name_match: bool = False
+    identical_file: bool = False    # 한글에 든 사진과 바이트까지 같은가
+    size_ratio: float = 0.0         # 한글에 든 사진의 몇 배 크기인가
     refined: bool = False
     notes: List[str] = field(default_factory=list)
 
@@ -83,6 +92,8 @@ class Candidate:
             bits.append(self.orientation)
         if self.refined:
             bits.append("원본 화소 재확인")
+        if self.size_ratio:
+            bits.append(f"한글 속 사진의 {self.size_ratio:.1f}배 크기")
         return " · ".join(bits)
 
 
@@ -108,6 +119,8 @@ class Query:
     hint_name: str = ""          # 한글이 적어 둔 원래 파일 이름
     hint_width: int = 0
     hint_height: int = 0
+    pixels: int = 0              # 한글에 든 사진의 화소 수
+    head_sha1: str = ""          # 같은 파일인지 가리는 데 쓴다
 
     @property
     def primary(self) -> Optional[FP.VisualFingerprint]:
@@ -132,6 +145,10 @@ def build_query(data: bytes, hint=None) -> Query:
         except Exception:
             pass
     query = Query(exif=fingerprint_bytes(data), variants=variants, data=data)
+    size = real_size(data)
+    if size:
+        query.pixels = size[0] * size[1]
+    query.head_sha1 = _head_sha1_bytes(data)
     if hint is not None:
         query.hint_name = getattr(hint, "original_name", "") or ""
         query.hint_width = getattr(hint, "width", 0) or 0
@@ -141,6 +158,41 @@ def build_query(data: bytes, hint=None) -> Query:
 
 def _norm_name(name: str) -> str:
     return unicodedata.normalize("NFC", Path(name).name).casefold()
+
+
+def _head_sha1_bytes(data: bytes) -> str:
+    """색인이 파일에 쓰는 것과 같은 방식으로 앞부분 지문을 만든다."""
+    h = hashlib.sha1()
+    h.update(str(len(data)).encode())
+    h.update(data[:65536])
+    return h.hexdigest()
+
+
+def same_photo(a: PhotoRecord, b: PhotoRecord) -> bool:
+    """같은 사진의 다른 판본인가 (크기만 다른 사본인가).
+
+    보고서를 만들 때 줄여 둔 사본이 원본 폴더에 함께 남아 있는 일이 흔하다.
+    그 사본은 한글에 든 사진과 화소까지 똑같아서 점수가 가장 높게 나온다.
+    하지만 제본에 필요한 것은 큰 원본이므로, 같은 사진임을 알아보고
+    그중 큰 쪽을 골라야 한다.
+    """
+    if a.path == b.path:
+        return True
+    if a.unique_id and a.unique_id == b.unique_id:
+        return True
+    if a.taken_at and a.taken_at == b.taken_at and a.model == b.model:
+        if a.subsec and b.subsec and a.subsec != b.subsec:
+            return False            # 연사로 같은 초에 찍힌 다른 사진
+        return True
+    if not (a.has_visual and b.has_visual):
+        return False
+    if FP.aspect_gap(a.aspect, b.aspect) > 0.02:
+        return False
+    if FP.hamming(a.dhash, b.dhash) > 16:
+        return False
+    if FP.tile_distance(a.tile_array(), b.tile_array()) > 10:
+        return False
+    return FP.ncc(a.gray_array(), b.gray_array()) > 0.97
 
 
 class Matcher:
@@ -303,8 +355,71 @@ class Matcher:
             cand.notes.append(f"원본 화소 비교 {fine:+.4f}, 가장 다른 부분 {peak:.1f}")
             cand.score = 0.30 * cand.score + 0.70 * adjusted
 
+    # -- 마무리: 같은 사진이면 큰 쪽을 고른다 ------------------------------
+    @staticmethod
+    def _prefer_larger(query: Query, decision: SlotMatch) -> SlotMatch:
+        """줄여 둔 사본 대신 큰 원본을 고른다.
+
+        보고서용으로 줄인 사본이 원본 폴더에 함께 남아 있으면, 그 사본이
+        한글에 든 사진과 화소까지 같아서 점수가 가장 높다. 하지만 제본에는
+        큰 원본이 필요하다. 그래서 '같은 사진' 들을 묶고 그중 큰 것을 고른다.
+        크기가 비슷하면 갈아타지 않는다 — 거의 똑같아 보이는 다른 사진일 수 있다.
+        """
+        if decision.best is None:
+            return decision
+        pool = [decision.best] + list(decision.runners_up)
+        chosen = decision.best
+        group = [c for c in pool if same_photo(chosen.record, c.record)]
+        if len(group) > 1:
+            def area(c):
+                return c.record.width * c.record.height
+
+            biggest = max(group, key=lambda c: (area(c), c.record.size))
+            if biggest is not chosen and area(chosen) and \
+                    area(biggest) >= area(chosen) * LARGER_RATIO:
+                biggest.notes.append(
+                    f"같은 사진이 여러 판본 있어 가장 큰 것을 골랐습니다 "
+                    f"({chosen.record.width}×{chosen.record.height} → "
+                    f"{biggest.record.width}×{biggest.record.height})")
+                decision.runners_up = [c for c in pool if c is not biggest][:3]
+                decision.best = biggest
+                chosen = biggest
+                if decision.verdict == REVIEW and not decision.message.startswith("EXIF 는"):
+                    decision.verdict = CERTAIN
+                    decision.message = ""
+
+        # 고른 것이 한글에 든 사진과 견줘 얼마나 큰지 남긴다
+        if query.pixels and chosen.record.width and chosen.record.height:
+            chosen.size_ratio = (chosen.record.width * chosen.record.height) / query.pixels
+        if query.head_sha1 and chosen.record.head_sha1 == query.head_sha1:
+            chosen.identical_file = True
+        return decision
+
+    @staticmethod
+    def _warn_if_not_original(query: Query, decision: SlotMatch,
+                              allow_same_size: bool) -> SlotMatch:
+        """고른 것이 원본이 아니라 또 다른 저용량 사본으로 보이면 알린다."""
+        if decision.best is None or allow_same_size or not query.pixels:
+            return decision
+        cand = decision.best
+        if not (cand.record.width and cand.record.height):
+            return decision
+        if cand.size_ratio >= ORIGINAL_RATIO:
+            return decision
+        if cand.identical_file:
+            note = ("한글에 든 사진과 완전히 같은 파일입니다. "
+                    "원본이 아니라 보고서용으로 줄인 사본으로 보입니다.")
+        else:
+            note = (f"한글에 든 사진과 크기가 비슷합니다 "
+                    f"({cand.record.width}×{cand.record.height}). "
+                    "원본이 아니라 줄인 사본일 수 있습니다.")
+        decision.verdict = REVIEW
+        decision.message = (decision.message + " / " if decision.message else "") + note
+        return decision
+
     # -- 종합 ------------------------------------------------------------
-    def match(self, query: Query, *, exclude: Optional[set] = None) -> SlotMatch:
+    def match(self, query: Query, *, exclude: Optional[set] = None,
+              allow_same_size: bool = False) -> SlotMatch:
         exclude = exclude or set()
         pool: Dict[str, Candidate] = {}
 
@@ -342,13 +457,15 @@ class Matcher:
 
         exif_hits = [c for c in ranked if c.exif_key]
         if exif_hits:
-            return self._decide_with_exif(query, exif_hits, ranked)
+            return self._finish(query, self._decide_with_exif(query, exif_hits, ranked),
+                                allow_same_size)
 
         if len(name_hits) == 1 and name_hits[0].score >= 0.45:
             best = name_hits[0]
             others = [c for c in ranked if c is not best][:3]
-            return SlotMatch(verdict=CERTAIN, best=best, runners_up=others,
-                             message="한글 파일에 적힌 원래 파일 이름과 같은 사진을 찾았습니다")
+            return self._finish(query, SlotMatch(
+                verdict=CERTAIN, best=best, runners_up=others,
+                message="한글 파일에 적힌 원래 파일 이름과 같은 사진을 찾았습니다"), allow_same_size)
 
         top = ranked[:5]
         if len(top) >= 2 and (top[0].score - top[1].score) < REFINE_MARGIN and top[0].score >= SCORE_REVIEW:
@@ -367,11 +484,42 @@ class Matcher:
             verdict, msg = REVIEW, "닮긴 했지만 확신할 수 없습니다"
         else:
             verdict, msg = NOT_FOUND, "충분히 닮은 사진이 없습니다"
-        return SlotMatch(verdict=verdict, best=best if verdict != NOT_FOUND else None,
-                         runners_up=[c for c in ranked[1:4]], message=msg)
+        return self._finish(query, SlotMatch(
+            verdict=verdict, best=best if verdict != NOT_FOUND else None,
+            runners_up=[c for c in ranked[1:4]], message=msg), allow_same_size)
+
+    def _finish(self, query: Query, decision: SlotMatch, allow_same_size: bool) -> SlotMatch:
+        decision = self._prefer_larger(query, decision)
+        return self._warn_if_not_original(query, decision, allow_same_size)
+
+    @staticmethod
+    def _collapse_same_photo(candidates: List[Candidate]) -> List[Candidate]:
+        """같은 사진의 여러 판본을 하나로 묶고, 그중 가장 큰 것만 남긴다.
+
+        이걸 하지 않으면 '원본 + 보고서용 사본' 을 연사로 찍은 다른 사진으로 오인해
+        멀쩡한 짝을 '확인 필요' 로 내려보낸다.
+        """
+        groups: List[List[Candidate]] = []
+        for cand in candidates:
+            for group in groups:
+                if same_photo(group[0].record, cand.record):
+                    group.append(cand)
+                    break
+            else:
+                groups.append([cand])
+        out = []
+        for group in groups:
+            biggest = max(group, key=lambda c: (c.record.width * c.record.height, c.record.size))
+            if len(group) > 1 and biggest is not group[0]:
+                biggest.notes.append(
+                    f"같은 사진이 여러 판본 있어 가장 큰 것을 골랐습니다 "
+                    f"({biggest.record.width}×{biggest.record.height})")
+            out.append(biggest)
+        return out
 
     def _decide_with_exif(self, query: Query, exif_hits: List[Candidate],
                           ranked: List[Candidate]) -> SlotMatch:
+        exif_hits = self._collapse_same_photo(exif_hits)
         strong = exif_hits[0].exif_key in ("사진 고유 ID", "촬영시각+1/100초+기종", "촬영시각+기종")
         others = [c for c in ranked if c is not exif_hits[0]][:3]
         if len(exif_hits) > 1:

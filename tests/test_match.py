@@ -206,3 +206,83 @@ def test_흑백_원본끼리는_감점되지_않는다(tmp_path):
     result = matcher.match(build_query(shrink(gray_src.getvalue(), keep_exif=False)))
     assert result.verdict == CERTAIN
     assert result.path.endswith("SCAN_001.JPG")
+
+
+def _pair(seed, small=(400, 300), big=(2400, 1800), exif=None):
+    """같은 사진의 '큰 원본' 과 '보고서용으로 줄인 사본' 을 만든다."""
+    base = make_jpeg(*big, seed=seed, exif=exif)
+    im = Image.open(io.BytesIO(base))
+    buf = io.BytesIO()
+    kw = {"quality": 85}
+    if exif:
+        kw["exif"] = exif
+    im.resize(small, Image.LANCZOS).save(buf, "JPEG", **kw)
+    return base, buf.getvalue()
+
+
+def test_같은_사진이면_큰_원본을_고른다(tmp_path):
+    """보고서용으로 줄인 사본이 원본 폴더에 함께 있으면 그쪽 점수가 더 높다.
+    하지만 제본에 필요한 것은 큰 원본이다."""
+    big, small = _pair(seed=21)
+    photos = {"DSC_0021.JPG": big, "보고서용_DSC_0021.jpg": small}
+    photos.update({f"D{i}.JPG": make_jpeg(2400, 1800, seed=700 + i) for i in range(8)})
+    matcher, _ = build_index(tmp_path, photos)
+
+    result = matcher.match(build_query(small))       # 한글에 든 것은 줄인 쪽
+    assert result.verdict == CERTAIN
+    assert result.path.endswith("DSC_0021.JPG")
+    assert result.best.size_ratio > 30
+
+
+def test_EXIF_가_같은_판본도_연사로_오인하지_않는다(tmp_path):
+    blob = _exif("D5500", "2025:09:04 11:16:16", "59")
+    big, small = _pair(seed=22, exif=blob)
+    photos = {"DSC_0022.JPG": big, "보고서용_DSC_0022.jpg": small}
+    photos.update({f"D{i}.JPG": make_jpeg(2400, 1800, seed=800 + i) for i in range(8)})
+    matcher, _ = build_index(tmp_path, photos)
+
+    result = matcher.match(build_query(small))
+    assert result.verdict == CERTAIN
+    assert result.path.endswith("DSC_0022.JPG")
+
+
+def test_줄인_사본밖에_없으면_알려_준다(tmp_path):
+    _big, small = _pair(seed=23)
+    photos = {"보고서용_DSC_0023.jpg": small}
+    photos.update({f"D{i}.JPG": make_jpeg(2400, 1800, seed=900 + i) for i in range(8)})
+    matcher, _ = build_index(tmp_path, photos)
+
+    result = matcher.match(build_query(small))
+    assert result.verdict == REVIEW
+    assert "줄인 사본" in result.message
+    assert result.best.identical_file                # 바이트까지 같은 파일이다
+
+
+def test_크기_경고를_끌_수_있다(tmp_path):
+    _big, small = _pair(seed=24)
+    photos = {"보고서용_DSC_0024.jpg": small}
+    photos.update({f"D{i}.JPG": make_jpeg(2400, 1800, seed=950 + i) for i in range(8)})
+    matcher, _ = build_index(tmp_path, photos)
+
+    result = matcher.match(build_query(small), allow_same_size=True)
+    assert result.verdict == CERTAIN
+
+
+def test_거의_같아_보이는_다른_사진끼리는_갈아타지_않는다(tmp_path):
+    """등고선만 같고 표시 하나가 다른 도면 두 장. 크기가 같으면 건드리면 안 된다."""
+    from PIL import ImageDraw
+
+    base = Image.open(io.BytesIO(make_jpeg(1200, 800, seed=25))).convert("RGB")
+    marked = base.copy()
+    ImageDraw.Draw(marked).ellipse((500, 300, 700, 500), fill=(220, 30, 30))
+    bufs = {}
+    for name, im in (("도면_기존.JPG", base), ("도면_변경.JPG", marked)):
+        b = io.BytesIO()
+        im.save(b, "JPEG", quality=94)
+        bufs[name] = b.getvalue()
+    photos = dict(bufs)
+    photos.update({f"D{i}.JPG": make_jpeg(1200, 800, seed=980 + i) for i in range(6)})
+    matcher, _ = build_index(tmp_path, photos)
+
+    result = matcher.match(build_query(shrink(bufs["도면_변경.JPG"], factor=2)))
+    assert result.path.endswith("도면_변경.JPG")

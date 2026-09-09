@@ -135,6 +135,7 @@ class PlacedFile:
     origin: str = "원본"          # 원본 | 저용량
     verdict: str = NOT_FOUND
     score: float = 0.0
+    size_ratio: float = 0.0      # 한글 속 사진의 몇 배 크기인가
     reason: str = ""
     message: str = ""
     skipped: str = ""            # 비어 있지 않으면 넣지 않은 이유
@@ -179,6 +180,7 @@ def place(doc: HwpDocument,
         rec = PlacedFile(slot=slot, name=name,
                          verdict=match.verdict,
                          score=match.best.score if match.best else 0.0,
+                         size_ratio=match.best.size_ratio if match.best else 0.0,
                          reason=match.best.reason if match.best else "",
                          message=match.message)
 
@@ -277,7 +279,7 @@ def write_csv(path: Path, rows: Sequence[tuple]) -> None:
     with open(path, "w", encoding="utf-8-sig", newline="") as fh:
         writer = csv.writer(fh)
         writer.writerow([
-            "한글파일", "사진이름", "구역", "이름출처", "판정", "점수",
+            "한글파일", "사진이름", "구역", "이름출처", "판정", "점수", "크기배수",
             "넣은파일", "가져온곳", "종류", "메모",
         ])
         writer.writerows(rows)
@@ -293,6 +295,7 @@ def csv_rows(doc: HwpDocument, placed: Sequence[PlacedFile]) -> List[tuple]:
             rec.slot.caption_source,
             rec.verdict if not rec.skipped else "넣지않음",
             f"{rec.score:.3f}" if rec.score else "",
+            f"{rec.size_ratio:.1f}배" if rec.size_ratio else "",
             str(rec.target) if rec.target else "",
             rec.source,
             rec.origin,
