@@ -171,3 +171,39 @@ def test_셀_안의_표는_따로_센다():
     assert result.tables[0].cells[0].text == "바깥"       # 안쪽 글이 섞이지 않는다
     assert result.tables[1].cells[0].text == "안쪽"
     assert result.tables[1].depth == 1
+
+
+def test_단색과_이미지가_함께_켜진_배경도_읽는다():
+    """단색 채우기는 12바이트다. 17바이트로 잘못 세면 그림 번호가 5바이트 밀린다."""
+    from conftest import build_doc_info
+
+    info = parse_doc_info(build_doc_info(
+        [(1, "jpg"), (2, "jpg")],
+        [{"image_bin_id": 2, "solid": True}],
+    ))
+    assert info.border_fills[0].fill_type == 0x03
+    assert info.image_bin_id_for_border_fill(1) == 2
+    assert not info.warnings                       # 추정으로 넘어가지 않아야 한다
+
+
+def test_그러데이션과_이미지가_함께_켜진_배경도_읽는다():
+    from conftest import build_doc_info
+
+    info = parse_doc_info(build_doc_info(
+        [(1, "jpg")] * 3,
+        [{"image_bin_id": 3, "gradient_colors": 2}],
+    ))
+    assert info.border_fills[0].fill_type == 0x06
+    assert info.image_bin_id_for_border_fill(1) == 3
+    assert not info.warnings
+
+
+def test_색_셋_이상인_그러데이션도_읽는다():
+    from conftest import build_doc_info
+
+    info = parse_doc_info(build_doc_info(
+        [(1, "jpg")] * 4,
+        [{"image_bin_id": 4, "solid": True, "gradient_colors": 4}],
+    ))
+    assert info.image_bin_id_for_border_fill(1) == 4
+    assert not info.warnings

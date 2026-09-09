@@ -96,21 +96,24 @@ def _parse_bin_data(payload: bytes, index: int) -> BinDataEntry:
 
 
 def _skip_solid_fill(r: Reader) -> None:
-    # 배경색, 무늬색, 무늬 종류, 무늬 배경색, 투명도
-    r.skip(4 + 4 + 4 + 4 + 1)
+    """단색 채우기는 12바이트다: 배경색, 무늬색, 무늬 종류.
+
+    투명도(alpha)는 여기가 아니라 채우기 블록 맨 끝에 종류별로 1바이트씩 붙는다.
+    여기서 함께 건너뛰면 뒤따르는 이미지 채우기의 위치가 5바이트씩 밀린다.
+    """
+    r.skip(4 + 4 + 4)
 
 
 def _skip_gradation_fill(r: Reader) -> None:
-    r.u8()          # 그러데이션 유형
+    r.u8()          # 그러데이션 유형 (스펙 문서는 INT16 이라 하나 실제는 1바이트)
     r.u32()         # 시작 각
     r.u32()         # 중심 x
     r.u32()         # 중심 y
     r.u32()         # 번짐 정도
     n = r.u32()     # 색 개수
     if n > 2:
-        r.skip(4 * n)   # 색상 위치
+        r.skip(4 * n)   # 색이 바뀌는 위치
     r.skip(4 * n)       # 색상
-    r.skip(1)           # 투명도
 
 
 def _read_image_fill(r: Reader) -> tuple:
@@ -141,9 +144,11 @@ def _parse_border_fill(payload: bytes, index: int, max_bin: int) -> BorderFillEn
         return entry
 
     body_start = r.pos
+    # 실제 문서로 확인한 순서: 단색 -> 그러데이션 -> 이미지.
+    # (fillType 비트로는 1 -> 4 -> 2 순서다. 비트 번호 순서가 아니다.)
     orders = (
-        (FILL_SOLID, FILL_GRADATION, FILL_IMAGE),   # 스펙 표기 순서
-        (FILL_SOLID, FILL_IMAGE, FILL_GRADATION),   # 일부 구현체
+        (FILL_SOLID, FILL_GRADATION, FILL_IMAGE),
+        (FILL_SOLID, FILL_IMAGE, FILL_GRADATION),   # 혹시 다르게 쓴 문서를 위한 대비
     )
     for order in orders:
         rr = Reader(payload, body_start)

@@ -13,8 +13,10 @@ from . import __version__
 from .hwp.extract import extract
 from .hwp.reader import EncryptedHwpError, HwpError
 from .index import PhotoIndex
-from .match import CERTAIN, NOT_FOUND, REVIEW, Matcher, assign, build_query
+from .match import CERTAIN, NOT_FOUND, REVIEW
 from .model import HwpDocument
+from .pipeline import (JobConfig, clean_path, collect_hwp, default_workers,
+                       run_job)
 from .organize import (LOWRES_PLAIN, LOWRES_SKIP, LOWRES_SUBDIR, LOWRES_SUFFIX,
                        STATE_NAME, csv_rows, place, read_state, resolve_folder,
                        state_entry, write_csv, write_state)
@@ -32,14 +34,6 @@ def _setup_console() -> None:
             stream.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
             pass
-
-
-def default_workers() -> int:
-    """동시에 읽을 사진 수.
-
-    실측상 코어 수보다 많이 띄우면 오히려 느려진다(디스크가 아니라 디코딩이 병목).
-    """
-    return max(2, min(8, os.cpu_count() or 4))
 
 
 def say(*args) -> None:
@@ -91,32 +85,6 @@ def _dur(seconds: float) -> str:
 
 
 # --- 경로 다루기 -------------------------------------------------------------
-
-def clean_path(text: str) -> str:
-    """탐색기에서 끌어다 놓으면 따옴표가 같이 붙는다. 그걸 떼어 낸다."""
-    text = (text or "").strip()
-    for quote in ('"', "'"):
-        if len(text) >= 2 and text.startswith(quote) and text.endswith(quote):
-            text = text[1:-1]
-            break
-    return text.strip().rstrip("\\/") or text.strip()
-
-
-def collect_hwp(paths: Sequence, recursive: bool = True) -> List[Path]:
-    out: List[Path] = []
-    for raw in paths:
-        p = Path(clean_path(str(raw)))
-        if p.is_file():
-            if p.suffix.lower() in HWP_SUFFIXES:
-                out.append(p)
-        elif p.is_dir():
-            walker = p.rglob("*") if recursive else p.glob("*")
-            for child in walker:
-                if child.is_file() and child.suffix.lower() in HWP_SUFFIXES \
-                        and not child.name.startswith("~"):
-                    out.append(child)
-    return sorted(set(out))
-
 
 # --- 대화형 ------------------------------------------------------------------
 
@@ -236,126 +204,96 @@ def _cache_path(args: argparse.Namespace) -> Path:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    files = collect_hwp(args.hwp, recursive=not args.no_recursive)
-    if not files:
+    if not collect_hwp(args.hwp, recursive=not args.no_recursive):
         say("한글 파일(.hwp/.hwpx)을 찾지 못했습니다.")
         return 1
     if not args.source:
         say("--source 로 원본 사진이 있는 폴더를 지정해 주세요.")
         return 1
-    dest_root = Path(clean_path(str(args.dest))) if args.dest else None
-    if dest_root is None:
+    if not args.dest:
         say("--dest 로 정리해 넣을 폴더를 지정해 주세요.")
         return 1
 
-    started = time.time()
-    say("")
-    say(f"● 한글 파일 {len(files)}개를 읽습니다.")
-    docs = load_documents(files, Progress("읽는 중", not args.quiet),
-                          include_floating=args.include_floating)
-    slots_total = sum(len(d.slots) for d in docs)
-    say(f"  표에서 사진 {slots_total}장과 이름을 찾았습니다.")
-    if not slots_total:
-        say("  넣을 사진이 없습니다.")
+    config = JobConfig(
+        hwp=list(args.hwp), source=list(args.source), dest=args.dest,
+        cache=args.cache, name_template=args.name, lowres=args.lowres,
+        flat=args.flat, strict=args.strict, allow_duplicate=args.allow_duplicate,
+        overwrite=args.overwrite, dry_run=args.dry_run,
+        create_missing=not args.no_create_missing,
+        include_floating=args.include_floating, recursive=not args.no_recursive,
+        workers=args.workers, fast_index=not args.no_fast_index,
+        make_report=not args.no_report, report_path=args.report, thumbs=args.thumbs,
+    )
+
+    bar = _Bars(not args.quiet)
+    result = run_job(config, on_message=bar.message, on_progress=bar.progress)
+    bar.finish()
+
+    if not result.ok and not result.cancelled:
         return 1
-
-    say("")
-    say(f"● 원본 사진 폴더를 훑습니다.")
-    index = PhotoIndex(_cache_path(args))
-    progress = Progress("색인 만드는 중", not args.quiet)
-    stats = index.refresh(args.source, workers=args.workers,
-                          fast=not args.no_fast_index, progress=progress)
-    progress.done()
-    say(f"  원본 후보 {stats['전체']:,}장 "
-        f"(새로 읽음 {stats['새로 읽음']:,} · 지난 결과 재사용 {stats['재사용']:,})")
-    if stats["전체"] == 0:
-        say("  원본 사진을 한 장도 찾지 못했습니다. 폴더 경로를 확인해 주세요.")
-        return 1
-
-    records = index.load_all(roots=args.source)
-    matcher = Matcher(records)
-
-    say("")
-    say("● 사진을 하나씩 대조합니다.")
-    existing = [p for p in dest_root.iterdir() if p.is_dir()] if dest_root.is_dir() else []
-    reports: List[DocReport] = []
-    rows: List[tuple] = []
-    states: List[dict] = []
-    counts = {CERTAIN: 0, REVIEW: 0, NOT_FOUND: 0}
-    lowres_used = 0
-    progress = Progress("대조 중", not args.quiet)
-    done = 0
-
-    for doc in docs:
-        matches = []
-        for slot in doc.slots:
-            item = doc.bin_items.get(slot.bin_id)
-            if item is None or not item.data:
-                from .match import SlotMatch
-                matches.append(SlotMatch(verdict=NOT_FOUND, message="문서에서 사진 자료를 꺼내지 못했습니다"))
-            else:
-                matches.append(matcher.match(build_query(item.data, doc.hints.get(slot.bin_id))))
-            done += 1
-            progress(done, slots_total, slot.caption)
-        if not args.allow_duplicate:
-            assign(matches)
-
-        if args.flat:
-            choice_path, choice_how = dest_root, "한 폴더에 모으기"
-            created = False
-        else:
-            choice = resolve_folder(doc, dest_root, existing=existing,
-                                    create_missing=not args.no_create_missing)
-            choice_path, choice_how, created = choice.path, choice.how, choice.created
-        if choice_path is None:
-            say(f"  · {doc.path.name}: 넣을 폴더를 찾지 못해 건너뜁니다.")
-            continue
-        if created and not args.dry_run:
-            existing.append(choice_path)
-
-        placed = place(doc, matches, choice_path,
-                       template=args.name,
-                       lowres=args.lowres,
-                       accept_review=not args.strict,
-                       overwrite=args.overwrite,
-                       dry_run=args.dry_run)
-        for rec in placed:
-            counts[rec.verdict] = counts.get(rec.verdict, 0) + 1
-            if rec.origin != "원본" and not rec.skipped:
-                lowres_used += 1
-        rows.extend(csv_rows(doc, placed))
-        states.append(state_entry(doc, choice_path, placed))
-        reports.append(DocReport(doc=doc, folder=choice_path, folder_how=choice_how,
-                                 matches=matches, placed=placed))
-    progress.done()
+    if result.cancelled:
+        return 130
 
     say("")
     say("● 결과")
-    say(f"  원본 확실       {counts.get(CERTAIN, 0):>5,}장")
-    say(f"  확인 필요       {counts.get(REVIEW, 0):>5,}장")
-    say(f"  못 찾음         {counts.get(NOT_FOUND, 0):>5,}장")
-    if lowres_used:
-        say(f"  저용량으로 대체 {lowres_used:>5,}장  (원본을 못 찾아 한글 파일 안의 사진을 넣었습니다)")
+    say(f"  원본 확실       {result.counts.get(CERTAIN, 0):>5,}장")
+    say(f"  확인 필요       {result.counts.get(REVIEW, 0):>5,}장")
+    say(f"  못 찾음         {result.counts.get(NOT_FOUND, 0):>5,}장")
+    if result.lowres_used:
+        say(f"  저용량으로 대체 {result.lowres_used:>5,}장  "
+            "(원본을 못 찾아 한글 파일 안의 사진을 넣었습니다)")
 
-    out_dir = dest_root / "_findpic" if not args.dry_run else dest_root
-    if not args.dry_run:
-        out_dir.mkdir(parents=True, exist_ok=True)
-        csv_path = out_dir / "결과목록.csv"
-        write_csv(csv_path, rows)
-        write_state(out_dir / STATE_NAME, states)
-        say(f"\n  결과 목록: {csv_path}")
-        if not args.no_report:
-            report_path = Path(clean_path(str(args.report))) if args.report else out_dir / "검토리포트.html"
-            report_mod.write(report_path, reports, thumbs=args.thumbs)
-            say(f"  검토 리포트: {report_path}")
-            say("    (브라우저로 열면 한글 파일 속 사진과 찾은 원본을 나란히 볼 수 있습니다)")
-    else:
+    if config.dry_run:
         say("\n  --dry-run 이라 실제로 파일을 넣지는 않았습니다.")
+    else:
+        if result.csv_path:
+            say(f"\n  결과 목록: {result.csv_path}")
+        if result.report_path:
+            say(f"  검토 리포트: {result.report_path}")
+            say("    (브라우저로 열면 한글 파일 속 사진과 찾은 원본을 나란히 볼 수 있습니다)")
 
-    say(f"\n  걸린 시간 {_dur(time.time() - started)}")
-    if counts.get(REVIEW) or counts.get(NOT_FOUND):
+    say(f"\n  걸린 시간 {_dur(result.elapsed)}")
+    if result.counts.get(REVIEW) or result.counts.get(NOT_FOUND):
         say("\n  '확인 필요' 와 '못 찾음' 은 검토 리포트에서 눈으로 확인해 주세요.")
     return 0
+
+
+class _Bars:
+    """파이프라인이 알려 주는 것을 터미널 모양으로 옮긴다."""
+
+    def __init__(self, enabled: bool):
+        self.enabled = enabled
+        self.bar: Optional[Progress] = None
+        self.stage = ""
+
+    def message(self, text: str, kind: str = "info") -> None:
+        self._close()
+        if kind == "head":
+            say("")
+            say(f"● {text}")
+        elif kind == "warn":
+            say(f"  · {text}")
+        elif kind == "error":
+            say(f"  {text}")
+        else:
+            say(f"  {text}")
+
+    def progress(self, stage: str, done: int, total: int, note: str = "") -> None:
+        if stage != self.stage:
+            self._close()
+            self.stage = stage
+            self.bar = Progress(stage, self.enabled)
+        if self.bar:
+            self.bar(done, total, note)
+
+    def _close(self) -> None:
+        if self.bar is not None:
+            self.bar.done()
+            self.bar = None
+            self.stage = ""
+
+    def finish(self) -> None:
+        self._close()
 
 
 def cmd_apply(args: argparse.Namespace) -> int:

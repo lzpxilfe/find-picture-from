@@ -43,17 +43,41 @@ def bin_data_record(bin_id: int, ext: str, *, compress: int = 2) -> bytes:
     return struct.pack("<HH", prop, bin_id) + wchars(ext)
 
 
-def border_fill_record(*, image_bin_id: int = 0, fill_mode: int = 5) -> bytes:
-    """테두리/배경 레코드. image_bin_id 가 0 이면 채우기 없음."""
+def border_fill_record(*, image_bin_id: int = 0, fill_mode: int = 5,
+                       solid: bool = False, gradient_colors: int = 0) -> bytes:
+    """테두리/배경 레코드.
+
+    실제 문서에서 확인한 채우기 블록 순서를 그대로 따른다.
+        fillType(u32) -> [단색 12바이트] -> [그러데이션] -> [이미지 6바이트]
+        -> 추가정보 크기(u32) -> 종류마다 투명도 1바이트
+    """
     body = struct.pack("<H", 0)                 # 속성
     body += b"\x00\x00\x00\x00\x00\x00" * 5     # 테두리 4방향 + 대각선
+
+    fill_type = 0
+    if solid:
+        fill_type |= 0x01
     if image_bin_id:
-        body += struct.pack("<I", 0x02)         # 이미지 채우기
+        fill_type |= 0x02
+    if gradient_colors:
+        fill_type |= 0x04
+    body += struct.pack("<I", fill_type)
+    if not fill_type:
+        return body + struct.pack("<I", 0)
+
+    if solid:
+        body += struct.pack("<IIi", 0x00FFFFFF, 0, -1)      # 배경색, 무늬색, 무늬 종류
+    if gradient_colors:
+        n = gradient_colors
+        body += struct.pack("<BIIIII", 1, 0, 50, 50, 50, n)
+        if n > 2:
+            body += b"\x00" * (4 * n)                       # 색이 바뀌는 위치
+        body += b"\x00" * (4 * n)                           # 색상
+    if image_bin_id:
         body += struct.pack("<BbbB", fill_mode, 0, 0, 0)
         body += struct.pack("<H", image_bin_id)
-        body += b"\x00" * 5
-    else:
-        body += struct.pack("<I", 0)
+    body += struct.pack("<I", 0)                            # 추가정보 크기
+    body += b"\x00" * bin(fill_type).count("1")             # 종류별 투명도
     return body
 
 
@@ -93,12 +117,17 @@ def build_section(cells) -> bytes:
 
 
 def build_doc_info(bin_items, border_fills) -> bytes:
-    """bin_items: [(storage_id, ext), ...] / border_fills: [image_bin_id 또는 0, ...]"""
+    """bin_items: [(storage_id, ext), ...]
+
+    border_fills 의 각 항목은 image_bin_id 정수이거나,
+    border_fill_record 에 그대로 넘길 dict 다.
+    """
     out = record(T.DOCUMENT_PROPERTIES, 0, b"\x00" * 26)
     for storage_id, ext in bin_items:
         out += record(T.BIN_DATA, 1, bin_data_record(storage_id, ext))
-    for image_bin_id in border_fills:
-        out += record(T.BORDER_FILL, 1, border_fill_record(image_bin_id=image_bin_id))
+    for entry in border_fills:
+        kwargs = entry if isinstance(entry, dict) else {"image_bin_id": entry}
+        out += record(T.BORDER_FILL, 1, border_fill_record(**kwargs))
     return out
 
 
