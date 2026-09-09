@@ -173,8 +173,10 @@ def _esc(text) -> str:
 def build(reports: Sequence[DocReport], *, title: str = "사진 원본 찾기 결과",
           thumbs: str = "auto") -> str:
     """thumbs: 'all' 전부 / 'attention' 확인 필요한 것만 / 'auto' 문서 수를 보고 결정."""
+    photo_total = sum(len(rep.placed) for rep in reports)
     if thumbs == "auto":
-        thumbs = "all" if len(reports) <= 60 else "attention"
+        # 사진 한 장당 썸네일이 두 개 붙는다. 200장쯤부터 파일이 부담스러워진다.
+        thumbs = "all" if photo_total <= 200 else "attention"
 
     counts = {CERTAIN: 0, REVIEW: 0, NOT_FOUND: 0}
     lowres = 0
@@ -184,6 +186,7 @@ def build(reports: Sequence[DocReport], *, title: str = "사진 원본 찾기 �
             if rec.origin != "원본" and not rec.skipped:
                 lowres += 1
     total = sum(counts.values())
+    del photo_total
 
     parts = [
         "<!doctype html><html lang='ko'><head><meta charset='utf-8'>",

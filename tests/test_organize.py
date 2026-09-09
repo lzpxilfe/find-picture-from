@@ -155,3 +155,57 @@ def test_결과_목록과_리포트를_만든다(tmp_path):
     assert "<!doctype html>" in html
     assert "항공사진" in html and "못찾음" in html
     assert "data:image/jpeg;base64," in html          # 썸네일이 파일 안에 들어 있다
+
+
+def test_연번만_다른_폴더에_넣지_않는다(tmp_path):
+    """가장 위험한 오답이다. '대전_001' 의 사진이 '대전_002' 폴더로 가면 안 된다."""
+    dest = tmp_path / "정리"
+    for i in (2, 4, 6):
+        (dest / f"대전_{i:03d} 조사카드").mkdir(parents=True)
+    doc = make_doc(tmp_path, name="대전_001 조사카드.hwp")
+    doc.fields = {}
+    choice = resolve_folder(doc, dest)
+    assert choice.created                                # 새로 만들어야 한다
+    assert choice.path.name == "대전_001 조사카드"
+
+
+def test_숫자가_같으면_비슷한_이름_폴더를_받는다(tmp_path):
+    dest = tmp_path / "정리"
+    (dest / "대전_026 조사카드").mkdir(parents=True)
+    doc = make_doc(tmp_path, name="대전_026 조사카드 (수정).hwp")
+    doc.fields = {}
+    choice = resolve_folder(doc, dest)
+    assert not choice.created and choice.path.name == "대전_026 조사카드"
+
+
+def test_두루뭉술한_폴더가_모든_문서를_빨아들이지_않는다(tmp_path):
+    dest = tmp_path / "정리"
+    (dest / "조사카드").mkdir(parents=True)
+    for i in (1, 2, 3):
+        doc = make_doc(tmp_path, name=f"대전_{i:03d} 조사카드.hwp")
+        doc.fields = {}
+        choice = resolve_folder(doc, dest)
+        assert choice.created, f"대전_{i:03d} 이 '조사카드' 폴더로 빨려 들어갔다"
+
+
+def test_연번이_많아도_서로_다른_폴더로_간다(tmp_path):
+    """실제로 이 상황에서 60건이 30개 폴더로 몰리는 사고가 있었다."""
+    dest = tmp_path / "정리"
+    dest.mkdir()
+    existing = []
+    for i in range(2, 21, 2):
+        folder = dest / f"대전_{i:03d} 조사카드"
+        folder.mkdir()
+        existing.append(folder)
+
+    seen = {}
+    for i in range(1, 21):
+        doc = make_doc(tmp_path, name=f"대전_{i:03d} 조사카드.hwp")
+        doc.fields = {}
+        choice = resolve_folder(doc, dest, existing=list(existing))
+        assert choice.path.name not in seen, \
+            f"{doc.path.name} 이 {seen.get(choice.path.name)} 과 같은 폴더로 갔다"
+        seen[choice.path.name] = doc.path.name
+        if choice.created:
+            existing.append(choice.path)
+    assert len(seen) == 20

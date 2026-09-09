@@ -8,6 +8,7 @@ from __future__ import annotations
 import csv
 import difflib
 import json
+import re
 import shutil
 import unicodedata
 from dataclasses import dataclass, field
@@ -27,9 +28,40 @@ LOWRES_SKIP = "skip"          # 넣지 않는다
 LOWRES_MARK = "저용량"
 
 
+_DIGITS = re.compile(r"\d+")
+
+
 def _norm(text: str) -> str:
     text = unicodedata.normalize("NFC", text or "")
     return "".join(ch for ch in text.lower() if not ch.isspace())
+
+
+def digit_signature(text: str):
+    """이름에 든 숫자들. 보고서 이름에서 숫자는 곧 신원이다.
+
+    '대전_001 조사카드' 와 '대전_002 조사카드' 는 글자로만 보면 94% 닮았지만
+    완전히 다른 유적이다. 숫자가 다르면 아무리 닮아도 같은 것으로 보면 안 된다.
+    """
+    return tuple(int(m) for m in _DIGITS.findall(unicodedata.normalize("NFC", text or "")))
+
+
+def _digits_agree(folder_name: str, doc_name: str) -> bool:
+    """폴더 이름의 숫자가 모두 문서 이름에도 있어야 한다.
+
+    '대전_002 조사카드' 와 '대전_001 조사카드' 는 글자로만 보면 94% 닮았지만
+    다른 건이다. 반대로 '효평동 유물산포지2' 폴더는 '2025 대전 효평동
+    유물산포지2 정밀지표조사.hwp' 의 폴더가 맞다 — 폴더의 숫자(2)가 문서에도 있다.
+
+    문서에 숫자가 있는데 폴더에 하나도 없으면, 그 폴더는 여러 건을 한꺼번에
+    빨아들이는 두루뭉술한 이름일 가능성이 크므로 받지 않는다.
+    """
+    folder_digits = set(digit_signature(folder_name))
+    doc_digits = set(digit_signature(doc_name))
+    if not folder_digits and not doc_digits:
+        return True
+    if not doc_digits or not folder_digits:
+        return False
+    return folder_digits <= doc_digits
 
 
 @dataclass
@@ -43,7 +75,7 @@ class FolderChoice:
 def resolve_folder(doc: HwpDocument, dest_root: Path, *,
                    existing: Optional[Sequence[Path]] = None,
                    create_missing: bool = True,
-                   fuzzy_cutoff: float = 0.82) -> FolderChoice:
+                   fuzzy_cutoff: float = 0.90) -> FolderChoice:
     """한글 파일 하나에 대응하는 '이미 만들어 둔 폴더'를 찾는다.
 
     이름이 정확히 같은 폴더 -> 공백/대소문자만 다른 폴더 -> 도면 명칭 같은
@@ -64,20 +96,24 @@ def resolve_folder(doc: HwpDocument, dest_root: Path, *,
             keys.append((value, f"문서의 '{field_name}' 과 같은 폴더"))
 
     for value, how in keys:
-        hits = by_norm.get(_norm(value))
+        hits = [p for p in by_norm.get(_norm(value), []) if _digits_agree(p.name, value)]
         if hits:
             return FolderChoice(path=hits[0], how=how,
                                 ambiguous=[str(p) for p in hits[1:]])
 
-    # 폴더 이름이 파일 이름 안에 통째로 들어 있는 경우 (가장 긴 것을 고른다)
-    contained = [p for p in existing if _norm(p.name) and _norm(p.name) in _norm(stem)]
+    # 폴더 이름이 파일 이름 안에 통째로 들어 있는 경우 (가장 긴 것을 고른다).
+    # 숫자가 어긋나면 다른 건이므로 제외한다.
+    contained = [p for p in existing
+                 if _norm(p.name) and _norm(p.name) in _norm(stem)
+                 and _digits_agree(p.name, stem)]
     if contained:
         contained.sort(key=lambda p: len(p.name), reverse=True)
         return FolderChoice(path=contained[0], how="폴더 이름이 파일 이름에 들어 있음",
                             ambiguous=[str(p) for p in contained[1:3]])
 
-    names = [p.name for p in existing]
+    # 마지막으로 이름이 비슷한 폴더. 숫자가 같은 것만 후보로 둔다.
     for value, _how in keys:
+        names = [p.name for p in existing if _digits_agree(p.name, value)]
         close = difflib.get_close_matches(value, names, n=3, cutoff=fuzzy_cutoff)
         if close:
             match = next(p for p in existing if p.name == close[0])
