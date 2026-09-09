@@ -33,6 +33,11 @@ SCORE_REVIEW = 0.62
 MARGIN_CERTAIN = 0.05
 # 종횡비가 이보다 어긋나면 '자른 사진'으로 보고 감점한다
 ASPECT_TOLERANCE = 0.04
+# 색이 있고 없고가 이만큼 어긋나면 원본이 아니라 흑백 사본이다.
+# 감점 폭은 '확실' 구간에서 '확인 필요' 구간으로 내려가도록 잡았다.
+CHROMA_TOLERANCE = 4.0
+CHROMA_SCALE = 95.0
+CHROMA_MAX_PENALTY = 0.32
 # 1차로 추려낼 후보 수
 SHORTLIST = 400
 # 1·2등이 이만큼 붙어 있으면 원본 화소를 더 크게 읽어 다시 비교한다
@@ -60,6 +65,7 @@ class Candidate:
     phash_distance: int = 10 ** 6
     tile_distance: float = 255.0
     aspect_gap: float = 1.0
+    chroma_gap: float = 0.0
     orientation: str = "그대로"
     name_match: bool = False
     refined: bool = False
@@ -219,11 +225,18 @@ class Matcher:
         cand.tile_distance = FP.tile_distance(fp.tile_array(), rec.tile_array())
         cand.aspect_gap = FP.aspect_gap(fp.aspect, rec.aspect)
 
+        cand.chroma_gap = abs(FP.chroma(fp.tile_array()) - FP.chroma(rec.tile_array()))
+
         ncc_part = max(0.0, cand.ncc)
         dhash_part = max(0.0, 1.0 - cand.dhash_distance / 256.0)
         phash_part = max(0.0, 1.0 - cand.phash_distance / 64.0)
         tile_part = max(0.0, 1.0 - cand.tile_distance / 80.0)
         score = 0.40 * ncc_part + 0.20 * dhash_part + 0.10 * phash_part + 0.30 * tile_part
+
+        if cand.chroma_gap > CHROMA_TOLERANCE:
+            # 흑백으로 바꿔 둔 사본이거나, 아예 다른 사진이다
+            score -= min(CHROMA_MAX_PENALTY, cand.chroma_gap / CHROMA_SCALE)
+            cand.notes.append(f"색이 들어 있는 정도가 {cand.chroma_gap:.0f}만큼 다름")
 
         if query.hint_width and query.hint_height and rec.width and rec.height:
             if (rec.width, rec.height) == (query.hint_width, query.hint_height):

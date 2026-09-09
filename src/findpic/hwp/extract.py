@@ -83,7 +83,8 @@ def extract_hwp5(path, *, min_edge: int = MIN_EDGE, min_pixels: int = MIN_PIXELS
     with Hwp5File(path) as f:
         if f.header.distribution:
             doc.warnings.append(
-                "배포용(읽기 전용) 문서라 본문이 따로 암호화되어 있습니다. 표와 이름을 읽지 못할 수 있습니다."
+                "배포용(읽기 전용) 문서입니다. 본문이 따로 암호화되어 있어 표와 사진을 읽을 수 없습니다. "
+                "한글에서 열어 일반 문서로 다시 저장한 뒤 실행해 주세요."
             )
         info = DI.parse_doc_info(f.stream("DocInfo"))
         doc.warnings.extend(info.warnings)
@@ -189,11 +190,34 @@ def _floating_slots(floating, doc: HwpDocument):
     return out
 
 
-def extract(path, **kwargs) -> HwpDocument:
-    """확장자를 보고 알맞은 방식으로 연다."""
+# 파일 첫머리 서명. 확장자가 거짓말하는 파일이 실제로 있어 이걸로 판별한다.
+_OLE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+_ZIP_MAGIC = b"PK\x03\x04"
+
+
+def sniff_format(path) -> str:
+    """확장자가 아니라 내용으로 형식을 가린다.
+
+    .hwpx 인데 속은 HWP 5.x 인 파일, .hwp 인데 속은 HWPX 인 파일이 실제로 돌아다닌다.
+    확장자만 믿으면 '읽을 수 없는 파일' 로 잘못 처리하게 된다.
+    """
     path = Path(path)
-    suffix = path.suffix.lower()
-    if suffix == ".hwpx":
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(8)
+    except OSError:
+        head = b""
+    if head.startswith(_OLE_MAGIC):
+        return "hwp"
+    if head.startswith(_ZIP_MAGIC):
+        return "hwpx"
+    return "hwpx" if path.suffix.lower() == ".hwpx" else "hwp"
+
+
+def extract(path, **kwargs) -> HwpDocument:
+    """내용을 보고 알맞은 방식으로 연다."""
+    path = Path(path)
+    if sniff_format(path) == "hwpx":
         from .hwpx import extract_hwpx
 
         return extract_hwpx(path, **kwargs)

@@ -113,3 +113,61 @@ def test_설명문은_NUL_에_둘러싸여_있어도_찾는다():
 def test_설명문이_없으면_빈_문자열():
     assert find_shape_description(b"\x00" * 200) == ""
     assert parse_picture_hint("그냥 글") is None
+
+
+def test_확장자가_거짓말해도_내용으로_형식을_가린다(tmp_path):
+    """.hwpx 인데 속은 HWP 5.x 인 파일, 그 반대인 파일이 실제로 돌아다닌다."""
+    from findpic.hwp.extract import sniff_format
+
+    ole = tmp_path / "속았지.hwpx"
+    ole.write_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 64)
+    assert sniff_format(ole) == "hwp"
+
+    zipped = tmp_path / "이것도.hwp"
+    zipped.write_bytes(b"PK\x03\x04" + b"\x00" * 64)
+    assert sniff_format(zipped) == "hwpx"
+
+    # 알 수 없는 내용이면 확장자를 따른다
+    unknown = tmp_path / "몰라.hwpx"
+    unknown.write_bytes(b"?" * 32)
+    assert sniff_format(unknown) == "hwpx"
+    assert sniff_format(tmp_path / "없는파일.hwp") == "hwp"
+
+
+def test_문단이_여럿이면_줄바꿈으로_잇는다():
+    from conftest import para_text, record
+    from findpic.hwp import tags as T
+
+    section = record(T.PARA_HEADER, 0, b"\x00" * 24)
+    section += record(T.CTRL_HEADER, 1, ctrl_header("tbl "))
+    section += record(T.TABLE, 2, b"\x00" * 44)
+    section += record(T.LIST_HEADER, 2, cell_record(col=0, row=0))
+    section += record(T.PARA_HEADER, 2, b"\x00" * 24)
+    section += record(T.PARA_TEXT, 3, para_text("첫째 줄"))
+    section += record(T.PARA_HEADER, 2, b"\x00" * 24)
+    section += record(T.PARA_TEXT, 3, para_text("둘째 줄"))
+    table = parse_section(section, section_index=0, max_bin=1).tables[0]
+    assert table.cells[0].text == "첫째 줄\n둘째 줄"
+
+
+def test_셀_안의_표는_따로_센다():
+    from conftest import para_text, record
+    from findpic.hwp import tags as T
+
+    section = record(T.PARA_HEADER, 0, b"\x00" * 24)
+    section += record(T.CTRL_HEADER, 1, ctrl_header("tbl "))          # 바깥 표
+    section += record(T.TABLE, 2, b"\x00" * 44)
+    section += record(T.LIST_HEADER, 2, cell_record(col=0, row=0))
+    section += record(T.PARA_HEADER, 2, b"\x00" * 24)
+    section += record(T.PARA_TEXT, 3, para_text("바깥"))
+    section += record(T.CTRL_HEADER, 3, ctrl_header("tbl "))          # 안쪽 표
+    section += record(T.TABLE, 4, b"\x00" * 44)
+    section += record(T.LIST_HEADER, 4, cell_record(col=0, row=0))
+    section += record(T.PARA_HEADER, 4, b"\x00" * 24)
+    section += record(T.PARA_TEXT, 5, para_text("안쪽"))
+
+    result = parse_section(section, section_index=0, max_bin=1)
+    assert len(result.tables) == 2
+    assert result.tables[0].cells[0].text == "바깥"       # 안쪽 글이 섞이지 않는다
+    assert result.tables[1].cells[0].text == "안쪽"
+    assert result.tables[1].depth == 1

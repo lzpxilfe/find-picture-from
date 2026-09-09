@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import csv
 import difflib
+import json
 import shutil
 import unicodedata
 from dataclasses import dataclass, field
@@ -193,6 +194,45 @@ def place(doc: HwpDocument,
             rec.target = None
         placed.append(rec)
     return placed
+
+
+STATE_NAME = "상태.json"
+
+
+def write_state(path: Path, entries: Sequence[dict]) -> None:
+    """어느 문서의 어느 사진을 어디에 넣었는지 남긴다.
+
+    나중에 사람이 리포트에서 고친 것을 다시 적용할 때(findpic apply) 쓴다.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"version": 1, "documents": list(entries)},
+                               ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def read_state(path: Path) -> List[dict]:
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return data.get("documents", []) if isinstance(data, dict) else []
+
+
+def state_entry(doc: HwpDocument, folder: Path, placed: Sequence[PlacedFile]) -> dict:
+    return {
+        "문서": doc.path.name,
+        "문서경로": str(doc.path),
+        "폴더": str(folder),
+        "사진": [
+            {
+                "이름": rec.name,
+                "번호": rec.slot.bin_id,
+                "넣은파일": str(rec.target) if rec.target else "",
+                "종류": rec.origin,
+                "판정": rec.verdict,
+            }
+            for rec in placed
+        ],
+    }
 
 
 def write_csv(path: Path, rows: Sequence[tuple]) -> None:

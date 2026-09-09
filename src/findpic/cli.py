@@ -15,7 +15,8 @@ from .index import PhotoIndex
 from .match import CERTAIN, NOT_FOUND, REVIEW, Matcher, assign, build_query
 from .model import HwpDocument
 from .organize import (LOWRES_PLAIN, LOWRES_SKIP, LOWRES_SUBDIR, LOWRES_SUFFIX,
-                       csv_rows, place, resolve_folder, write_csv)
+                       STATE_NAME, csv_rows, place, read_state, resolve_folder,
+                       state_entry, write_csv, write_state)
 from .report import DocReport
 from . import report as report_mod
 
@@ -268,6 +269,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     existing = [p for p in dest_root.iterdir() if p.is_dir()] if dest_root.is_dir() else []
     reports: List[DocReport] = []
     rows: List[tuple] = []
+    states: List[dict] = []
     counts = {CERTAIN: 0, REVIEW: 0, NOT_FOUND: 0}
     lowres_used = 0
     progress = Progress("대조 중", not args.quiet)
@@ -311,6 +313,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             if rec.origin != "원본" and not rec.skipped:
                 lowres_used += 1
         rows.extend(csv_rows(doc, placed))
+        states.append(state_entry(doc, choice_path, placed))
         reports.append(DocReport(doc=doc, folder=choice_path, folder_how=choice_how,
                                  matches=matches, placed=placed))
     progress.done()
@@ -328,6 +331,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         out_dir.mkdir(parents=True, exist_ok=True)
         csv_path = out_dir / "결과목록.csv"
         write_csv(csv_path, rows)
+        write_state(out_dir / STATE_NAME, states)
         say(f"\n  결과 목록: {csv_path}")
         if not args.no_report:
             report_path = Path(clean_path(str(args.report))) if args.report else out_dir / "검토리포트.html"
@@ -340,6 +344,100 @@ def cmd_run(args: argparse.Namespace) -> int:
     say(f"\n  걸린 시간 {_dur(time.time() - started)}")
     if counts.get(REVIEW) or counts.get(NOT_FOUND):
         say("\n  '확인 필요' 와 '못 찾음' 은 검토 리포트에서 눈으로 확인해 주세요.")
+    return 0
+
+
+def cmd_apply(args: argparse.Namespace) -> int:
+    """사람이 리포트에서 고친 것을 그대로 다시 넣는다."""
+    import csv as _csv
+
+    csv_path = Path(clean_path(str(args.csv))) if args.csv else None
+    if csv_path is None or not csv_path.exists():
+        say("--csv 로 검토 리포트에서 내려받은 수정목록.csv 를 지정해 주세요.")
+        return 1
+
+    state_path = Path(clean_path(str(args.state))) if args.state else None
+    if state_path is None:
+        for candidate in (csv_path.parent / STATE_NAME,
+                          csv_path.parent / "_findpic" / STATE_NAME):
+            if candidate.exists():
+                state_path = candidate
+                break
+    if state_path is None or not state_path.exists():
+        say(f"어디에 넣었는지 적힌 {STATE_NAME} 을 찾지 못했습니다. --state 로 알려 주세요.")
+        say("  (정리한 결과 폴더 안 _findpic 폴더에 있습니다)")
+        return 1
+
+    documents = read_state(state_path)
+    if not documents:
+        say(f"{state_path} 를 읽지 못했습니다.")
+        return 1
+
+    lookup = {}
+    for entry in documents:
+        for photo in entry.get("사진", []):
+            lookup[(entry.get("문서", ""), photo.get("이름", ""))] = (entry, photo)
+
+    changed = missed = 0
+    with open(csv_path, encoding="utf-8-sig", newline="") as fh:
+        for row in _csv.DictReader(fh):
+            key = ((row.get("한글파일") or "").strip(), (row.get("사진이름") or "").strip())
+            found = lookup.get(key)
+            if found is None:
+                say(f"  · 어디에 넣었는지 알 수 없어 건너뜁니다: {key[0]} / {key[1]}")
+                missed += 1
+                continue
+            entry, photo = found
+            source = (row.get("가져올파일") or "").strip()
+            target = Path(photo.get("넣은파일") or "")
+            try:
+                if source:
+                    src = Path(clean_path(source))
+                    if not src.exists():
+                        say(f"  · 원본이 없습니다: {src}")
+                        missed += 1
+                        continue
+                    new_target = target.with_suffix(src.suffix or target.suffix)
+                    if args.dry_run:
+                        say(f"  (계획) {new_target.name} <- {src}")
+                    else:
+                        if target.exists() and target != new_target:
+                            target.unlink()
+                        import shutil as _shutil
+                        _shutil.copy2(src, new_target)
+                        photo["넣은파일"] = str(new_target)
+                        photo["종류"] = "원본"
+                        photo["판정"] = "사람이 고름"
+                else:
+                    # '맞는 원본이 없음' 을 고른 경우: 문서 안 저용량 사진으로 되돌린다
+                    doc = extract(entry.get("문서경로", ""))
+                    item = doc.bin_items.get(photo.get("번호"))
+                    if item is None or not item.data:
+                        say(f"  · 문서에서 사진을 꺼내지 못했습니다: {key[1]}")
+                        missed += 1
+                        continue
+                    new_target = target.with_suffix("." + (item.ext or "jpg"))
+                    if args.dry_run:
+                        say(f"  (계획) {new_target.name} <- {doc.path.name} 안의 저용량 사진")
+                    else:
+                        if target.exists() and target != new_target:
+                            target.unlink()
+                        new_target.parent.mkdir(parents=True, exist_ok=True)
+                        new_target.write_bytes(item.data)
+                        photo["넣은파일"] = str(new_target)
+                        photo["종류"] = "저용량"
+                        photo["판정"] = "사람이 고름"
+                changed += 1
+            except OSError as exc:
+                say(f"  · 넣지 못했습니다 ({exc}): {key[1]}")
+                missed += 1
+
+    if not args.dry_run and changed:
+        write_state(state_path, documents)
+    say("")
+    say(f"● {changed}건을 고쳐 넣었습니다." + (f" ({missed}건 실패)" if missed else ""))
+    if args.dry_run:
+        say("  --dry-run 이라 실제로 넣지는 않았습니다.")
     return 0
 
 
@@ -389,6 +487,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp_index = sub.add_parser("index", help="원본 사진 색인만 미리 만들어 두기")
     common(sp_index)
     source_dest(sp_index)
+
+    sp_apply = sub.add_parser("apply", help="검토 리포트에서 고친 것을 다시 넣기")
+    sp_apply.add_argument("--csv", help="검토 리포트에서 내려받은 수정목록.csv")
+    sp_apply.add_argument("--state", help=f"결과 폴더 안 _findpic/{STATE_NAME} 위치")
+    sp_apply.add_argument("--dry-run", action="store_true", help="실제로 넣지 않고 계획만 보기")
+    sp_apply.add_argument("--quiet", "-q", action="store_true")
 
     sp_run = sub.add_parser("run", help="찾아서 정리하기 (기본 동작)")
     common(sp_run)
@@ -444,6 +548,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return cmd_scan(args)
         if command == "index":
             return cmd_index(args)
+        if command == "apply":
+            return cmd_apply(args)
         return cmd_run(args)
     except KeyboardInterrupt:
         say("\n\n중단했습니다. 지금까지 만든 색인은 남아 있으니 다시 실행하면 이어서 합니다.")

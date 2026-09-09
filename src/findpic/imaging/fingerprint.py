@@ -132,6 +132,16 @@ def tile_distance(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.abs(a - b).mean())
 
 
+def chroma(tiles: np.ndarray) -> float:
+    """색이 얼마나 들어 있는가 (0 이면 완전한 흑백).
+
+    격자마다 RGB 최댓값과 최솟값의 차를 평균낸다. 원본을 흑백으로 바꿔 둔
+    파일은 밝기 배치가 원본과 완전히 같아서 다른 지표로는 걸러지지 않는다.
+    '색이 있느냐 없느냐' 는 그 경우를 가르는 거의 유일한 단서다.
+    """
+    return float((tiles.max(axis=2) - tiles.min(axis=2)).mean())
+
+
 def aspect_gap(a: float, b: float) -> float:
     """종횡비 차이. 0 이면 같고, 0.05 면 5% 어긋난 것."""
     if a <= 0 or b <= 0:

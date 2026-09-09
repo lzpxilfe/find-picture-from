@@ -158,3 +158,51 @@ def test_돌려_넣은_사진도_찾는다(tmp_path):
     result = matcher.match(build_query(buf.getvalue()))
     assert result.path.endswith("DSC_0005.JPG")
     assert result.best.orientation != "그대로"
+
+
+def test_흑백으로_바꾼_사본을_원본으로_치지_않는다(tmp_path):
+    """밝기 배치가 완전히 같아 다른 지표로는 걸러지지 않는 함정이다."""
+    from PIL import Image as _Image
+
+    color = make_jpeg(1200, 800, seed=41)
+    gray = io.BytesIO()
+    _Image.open(io.BytesIO(color)).convert("L").convert("RGB").save(gray, "JPEG", quality=94)
+    photos = {"GRAY_COPY.JPG": gray.getvalue()}
+    photos.update({f"D{i}.JPG": make_jpeg(1200, 800, seed=400 + i) for i in range(10)})
+    matcher, _ = build_index(tmp_path, photos)
+
+    result = matcher.match(build_query(shrink(color, keep_exif=False)))
+    assert result.verdict != CERTAIN
+    if result.best:
+        assert result.best.chroma_gap > 10
+
+
+def test_진짜_원본이_있으면_흑백_사본을_이긴다(tmp_path):
+    from PIL import Image as _Image
+
+    color = make_jpeg(1200, 800, seed=42)
+    gray = io.BytesIO()
+    _Image.open(io.BytesIO(color)).convert("L").convert("RGB").save(gray, "JPEG", quality=94)
+    photos = {"GRAY_COPY.JPG": gray.getvalue(), "TRUE_ORIGINAL.JPG": color}
+    photos.update({f"D{i}.JPG": make_jpeg(1200, 800, seed=500 + i) for i in range(10)})
+    matcher, _ = build_index(tmp_path, photos)
+
+    result = matcher.match(build_query(shrink(color, keep_exif=False)))
+    assert result.verdict == CERTAIN
+    assert result.path.endswith("TRUE_ORIGINAL.JPG")
+
+
+def test_흑백_원본끼리는_감점되지_않는다(tmp_path):
+    """스캔한 도면처럼 원래 흑백인 자료는 그대로 맞아야 한다."""
+    from PIL import Image as _Image
+
+    gray_src = io.BytesIO()
+    _Image.open(io.BytesIO(make_jpeg(1200, 800, seed=43))).convert("L").convert("RGB").save(
+        gray_src, "JPEG", quality=95)
+    photos = {"SCAN_001.JPG": gray_src.getvalue()}
+    photos.update({f"D{i}.JPG": make_jpeg(1200, 800, seed=600 + i) for i in range(10)})
+    matcher, _ = build_index(tmp_path, photos)
+
+    result = matcher.match(build_query(shrink(gray_src.getvalue(), keep_exif=False)))
+    assert result.verdict == CERTAIN
+    assert result.path.endswith("SCAN_001.JPG")

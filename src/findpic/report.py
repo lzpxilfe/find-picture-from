@@ -95,6 +95,18 @@ img.shot{width:100%;height:auto;border-radius:8px;border:1px solid var(--line);b
 .alts img{width:56px;height:42px;object-fit:cover;border-radius:5px;border:1px solid var(--line)}
 .note{background:var(--warnbg);color:var(--warn);border-radius:8px;padding:8px 11px;font-size:13px;margin-top:8px}
 .empty{padding:26px;text-align:center;color:var(--dim)}
+.pick{margin-top:10px;padding-top:10px;border-top:1px dashed var(--line)}
+.pick label{display:flex;gap:8px;align-items:center;margin-top:6px;font-size:12px;
+            color:var(--ink);cursor:pointer}
+.pick img{width:56px;height:42px;object-fit:cover;border-radius:5px;border:1px solid var(--line)}
+.pick .why{color:var(--dim)}
+.bar{position:sticky;bottom:0;margin-top:22px;padding:12px 16px;background:var(--card);
+     border:1px solid var(--line);border-radius:10px;display:flex;gap:12px;align-items:center;
+     flex-wrap:wrap;box-shadow:0 -2px 12px rgba(0,0,0,.06)}
+.bar button{font:inherit;font-size:13px;padding:8px 16px;border-radius:8px;cursor:pointer;
+            border:1px solid var(--ink);background:var(--ink);color:var(--bg);font-weight:600}
+.bar button[disabled]{opacity:.45;cursor:default}
+.bar .count{color:var(--dim);font-size:13px}
 """
 
 _JS = """
@@ -114,6 +126,42 @@ _JS = """
   }
   buttons.forEach(function(b){ b.addEventListener('click', function(){ apply(b.dataset.kind); }); });
   apply('전체');
+
+  // 고른 것을 CSV 로 내보낸다. findpic apply --csv 로 다시 적용할 수 있다.
+  var save = document.getElementById('save');
+  var count = document.getElementById('count');
+  if (!save) return;
+
+  function chosen(){
+    var out = [];
+    document.querySelectorAll('.row').forEach(function(row){
+      var hit = row.querySelector('input[type=radio]:checked');
+      if (!hit || hit.dataset.original === '1') return;
+      out.push([row.dataset.doc, row.dataset.name, hit.value]);
+    });
+    return out;
+  }
+  function refresh(){
+    var n = chosen().length;
+    count.textContent = n ? (n + '건 고침') : '고친 것이 없습니다';
+    save.disabled = !n;
+  }
+  document.addEventListener('change', function(e){
+    if (e.target.type === 'radio') refresh();
+  });
+  save.addEventListener('click', function(){
+    var rows = [['한글파일','사진이름','가져올파일']].concat(chosen());
+    var csv = rows.map(function(r){
+      return r.map(function(v){ return '"' + String(v).replace(/"/g, '""') + '"'; }).join(',');
+    }).join('\r\n');
+    var blob = new Blob(['\ufeff' + csv], {type: 'text/csv;charset=utf-8'});
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = '수정목록.csv';
+    a.click();
+    URL.revokeObjectURL(a.href);
+  });
+  refresh();
 })();
 """
 
@@ -155,6 +203,7 @@ def build(reports: Sequence[DocReport], *, title: str = "사진 원본 찾기 �
         parts.append(f"<button data-kind='{_esc(kind)}' aria-pressed='false'>{_esc(kind)}</button>")
     parts.append("</div>")
 
+    row_no = 0
     for rep in reports:
         parts.append("<section class='doc'><header>")
         parts.append(f"<h2>{_esc(rep.doc.path.name)}</h2>")
@@ -171,7 +220,10 @@ def build(reports: Sequence[DocReport], *, title: str = "사진 원본 찾기 �
             if match.best:
                 right = thumbnail(match.best.record.path, size)
 
-            parts.append(f"<div class='row' data-verdict='{_esc(rec.verdict)}'>")
+            parts.append(
+                f"<div class='row' data-verdict='{_esc(rec.verdict)}'"
+                f" data-doc='{_esc(rep.doc.path.name)}' data-name='{_esc(rec.name)}'>"
+            )
             parts.append("<div><div class='cellhead'>한글 파일 안</div>")
             parts.append(f"<div class='name'>{_esc(rec.slot.caption or '(이름 없음)')}</div>")
             if left:
@@ -209,22 +261,44 @@ def build(reports: Sequence[DocReport], *, title: str = "사진 원본 찾기 �
                 parts.append(f"<div class='note'>{_esc(rec.message)}</div>")
             if rec.skipped:
                 parts.append(f"<div class='note'>{_esc(rec.skipped)}</div>")
-            if match.runners_up and rec.verdict != CERTAIN:
-                parts.append("<div class='alts'><div class='cellhead'>다음 후보</div>")
-                for alt in match.runners_up[:3]:
+            if rec.verdict != CERTAIN and (match.best or match.runners_up):
+                parts.append("<div class='pick'><div class='cellhead'>어느 것이 맞나요?</div>")
+                group = f"pick{row_no}"
+                options = []
+                if match.best:
+                    options.append((match.best, True))
+                options.extend((alt, False) for alt in match.runners_up[:3])
+                for alt, is_current in options:
                     thumb = thumbnail(alt.record.path, 90)
                     img = f"<img src='{thumb}' alt=''>" if thumb else ""
+                    checked = " checked" if is_current else ""
+                    original = "1" if is_current else "0"
                     parts.append(
-                        f"<div class='altrow'>{img}<span>{_esc(Path(alt.record.path).name)}"
-                        f" · {alt.score * 100:.1f}점</span></div>"
+                        f"<label><input type='radio' name='{group}'"
+                        f" value='{_esc(alt.record.path)}' data-original='{original}'{checked}>"
+                        f"{img}<span>{_esc(Path(alt.record.path).name)}"
+                        f"<span class='why'> · {alt.score * 100:.1f}점</span></span></label>"
                     )
+                parts.append(
+                    f"<label><input type='radio' name='{group}' value='' data-original='0'>"
+                    "<span>맞는 원본이 없음 (저용량 사진을 그대로 둠)</span></label>"
+                )
                 parts.append("</div>")
             parts.append("</div></div>")
+            row_no += 1
 
         if not rep.placed:
             parts.append("<div class='empty'>이 문서에서는 표 안의 사진을 찾지 못했습니다.</div>")
         parts.append("</section>")
 
+    parts.append(
+        "<div class='bar'>"
+        "<button id='save' disabled>고친 것 내려받기 (수정목록.csv)</button>"
+        "<span class='count' id='count'></span>"
+        "<span class='count'>내려받은 파일로 <code>findpic apply --csv 수정목록.csv</code> 를 "
+        "실행하면 그대로 다시 넣습니다.</span>"
+        "</div>"
+    )
     parts.append(f"</div><script>{_JS}</script></body></html>")
     return "".join(parts)
 
