@@ -346,9 +346,11 @@ def test_큰_판본으로_갈아탔다고_판정을_올리지_않는다(tmp_path
     from findpic.imaging.exif import ExifFingerprint
     from findpic.match import SCORE_CERTAIN, Candidate, Matcher, Query, SlotMatch
 
-    low = Candidate(record=PhotoRecord(path="/a/small.jpg", width=800, height=600),
+    # 촬영 시각이 같으니 '같은 사진의 두 판본' 으로 묶인다
+    stamp = {"taken_at": "2025:03:26 11:10:19", "model": "NIKON D5600"}
+    low = Candidate(record=PhotoRecord(path="/a/small.jpg", width=800, height=600, **stamp),
                     score=0.667)
-    big = Candidate(record=PhotoRecord(path="/a/big.jpg", width=6000, height=4000),
+    big = Candidate(record=PhotoRecord(path="/a/big.jpg", width=6000, height=4000, **stamp),
                     score=0.667)
     assert low.score < SCORE_CERTAIN
     decision = SlotMatch(verdict=REVIEW, best=low, runners_up=[big],
