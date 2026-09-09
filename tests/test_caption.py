@@ -96,3 +96,69 @@ def test_글자_정돈():
     assert normalize_text("  항공　사진 \n") == "항공 사진"
     assert clean_caption("① 전경", strip_numbering=True) == "전경"
     assert clean_caption("사진 3. 근경", strip_numbering=True) == "근경"
+
+
+def test_캡션이_위에_오는_표에서도_제대로_찾는다():
+    """캡션/사진/캡션/사진 서식. 아래를 먼저 보는 기본 편향을 이겨야 한다."""
+    table, image_of = make_table([
+        (1, 0, 2, 1, 1, "기존"),
+        (1, 1, 2, 1, 7, ""),
+        (1, 2, 2, 1, 1, "변경"),
+        (1, 3, 2, 1, 8, ""),
+    ], {7: 1, 8: 2})
+    out = {b: (cap, src) for _c, b, cap, _g, src in resolve_table_captions(table, image_of)}
+    assert out[1] == ("기존", "위 칸")
+    assert out[2] == ("변경", "위 칸")
+
+
+def test_이름_하나에_사진_하나():
+    """위아래 양쪽에 폭이 맞는 칸이 있어도 옆 사진 이름을 가로채지 않는다."""
+    table, image_of = make_table([
+        (1, 0, 2, 1, 7, ""),
+        (1, 1, 2, 1, 1, "항공사진"),
+        (1, 2, 2, 1, 8, ""),          # 위(항공사진)·아래(전경) 둘 다 폭이 맞는다
+        (1, 3, 2, 1, 1, "전경"),
+    ], {7: 1, 8: 2})
+    out = {b: cap for _c, b, cap, _g, _s in resolve_table_captions(table, image_of)}
+    assert out == {1: "항공사진", 2: "전경"}
+
+
+def test_숫자나_기호뿐인_칸은_이름이_아니다():
+    for junk in ("6", "= 1 = 2 =", "- - -", "(3)"):
+        table, image_of = make_table([
+            (1, 0, 2, 1, 7, ""),
+            (1, 1, 2, 1, 1, junk),
+        ], {7: 1})
+        assert resolve_table_captions(table, image_of)[0][2] == "", junk
+
+
+def test_행_머리글은_여러_사진이_나눠_쓴다():
+    table, image_of = make_table([
+        (0, 0, 1, 2, 1, "사진자료"),
+        (1, 0, 2, 1, 7, ""),
+        (1, 1, 2, 1, 8, ""),
+    ], {7: 1, 8: 2})
+    out = resolve_table_captions(table, image_of)
+    assert all(cap == "사진자료" for _c, _b, cap, _g, _s in out)
+
+
+def test_빈_칸을_건너뛰어_옆_머리글을_집지_않는다():
+    """'연번' 옆이 비어 있는데 그 다음 '유적명' 을 값으로 집으면 안 된다."""
+    section = build_section([
+        (0, 0, 1, 1, 1, "도면 명칭"),
+        (1, 0, 1, 1, 1, "대전_026"),
+        (2, 0, 1, 1, 1, "연번"),
+        (3, 0, 1, 1, 1, ""),
+        (4, 0, 1, 1, 1, "유적명"),
+        (5, 0, 1, 1, 1, "대전 효평동 유물산포지2"),
+    ])
+    fields = extract_fields(parse_section(section, section_index=0, max_bin=1).tables)
+    assert fields.get("연번") is None
+    assert fields["도면 명칭"] == "대전_026"
+    assert fields["유적명"] == "대전 효평동 유물산포지2"
+
+
+def test_번호_벗기기가_멀쩡한_글을_자르지_않는다():
+    assert clean_caption("55세 이상 기간제 근로자", strip_numbering=True) == "55세 이상 기간제 근로자"
+    assert clean_caption("2구역 전경", strip_numbering=True) == "2구역 전경"
+    assert clean_caption("[1] 전경", strip_numbering=True) == "전경"

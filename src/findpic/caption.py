@@ -1,30 +1,73 @@
 """표에서 사진에 붙일 이름(캡션)을 찾아낸다.
 
-핵심 착안: 캡션 셀은 사진 셀과 **열 병합 범위가 정확히 같다**. 표 안의 다른
-내용 셀들은 병합 폭이 다르기 때문에, 이 조건만으로 대부분의 오답이 걸러진다.
+세 가지 착안으로 푼다.
 
-    ┌───────── 사진 (r11, c1, colspan 5) ─────────┐
-    ├───────── 항공사진 (r12, c1, colspan 5) ─────┤   ← 폭이 같다. 캡션이다.
+**1. 폭이 같은 칸이 이름이다.**
+캡션 칸은 사진 칸과 열 병합 범위가 정확히 같다. 표 안의 다른 내용 칸은 폭이 달라
+이 조건 하나로 대부분의 오답이 걸러진다.
 
-    ┌───────── 사진 (r3, c1, colspan 5) ──────────┐
-    ├── 현상보존 (r4,c1,span3) ──┼── ... ─────────┤   ← 폭이 다르다. 캡션이 아니다.
+    ┌───────── 사진 (r11, c1, 5칸) ─────────┐
+    ├───────── 항공사진 (r12, c1, 5칸) ─────┤   폭이 같다. 이름이다.
+
+    ┌───────── 사진 (r3, c1, 5칸) ──────────┐
+    ├── 현상보존 (3칸) ──┼── 시굴조사 ──────┤   폭이 다르다. 이름이 아니다.
+
+**2. 방향은 '밴드' 단위로 정한다.**
+한 표 안에서도 어떤 묶음은 이름이 아래에, 어떤 묶음은 위에 온다. 실제 조사카드가
+그렇다. 그래서 표 전체가 아니라 행 머리글이 덮는 행 묶음(밴드)마다 따로 정한다.
+방향이 명백한 사진(한쪽에만 폭이 맞는 칸이 있는 사진)만 투표한다.
+
+**3. 이름 하나에 사진 하나.**
+점수가 높은 짝부터 확정하고, 쓴 칸은 후보에서 뺀다. 그래야 위아래 양쪽에 폭이
+맞는 칸이 있는 사진이 옆 사진의 이름을 가로채지 않는다.
 """
 
 from __future__ import annotations
 
 import re
 import unicodedata
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 from .model import Cell, HwpDocument, PhotoSlot, Table
 
-# 캡션이라기엔 너무 긴 글자 수
+# 이보다 길면 이름이 아니라 본문이다
 MAX_CAPTION_LEN = 40
-# 이 정도보다 길면 '값'이지 이름이 아니다
+# 머리글 옆에서 읽어 오는 값의 길이 한도
 MAX_FIELD_VALUE_LEN = 200
 
-_WS = re.compile(r"[\s 　]+")
-_LEADING_NUM = re.compile(r"^\s*[<\[(【〈]?\s*(?:사진|그림|도면)?\s*[0-9①-⑳]+\s*[.)\]>》】]?\s*")
+# --- 점수표 -----------------------------------------------------------------
+SCORE_OWN_TEXT = 170        # 사진 칸에 이름을 같이 써 둔 경우
+SCORE_EXACT = 100           # 열 병합 범위가 정확히 같은 칸
+SCORE_OVERLAP = 45          # 걸치기만 하는 칸 (겹침 비율을 곱한다)
+SCORE_ROW_HEADER = 45       # 행 머리글 (여러 사진이 나눠 쓸 수 있다)
+BONUS_BELOW = 12            # 아래쪽을 조금 더 친다 (한국 보고서의 기본 서식)
+BONUS_ABOVE = 8
+BONUS_SAME_BAND = 25
+PENALTY_OTHER_BAND = -35
+BONUS_NO_PHOTO_ROW = 10     # 후보가 있는 행에 사진이 없으면 캡션 행일 가능성이 크다
+BONUS_SINGLE_LINE = 8
+BONUS_SHORT = 6
+PENALTY_COLON = -14         # '소재지:' 처럼 항목 이름인 경우
+PENALTY_SINGLE_CHAR = -20
+VOTE_BONUS = 15             # 밴드 투표 결과. 아래쪽 편향(12)을 이겨야 한다
+MIN_ACCEPT = 55
+
+# 투표가 방향 편향을 뒤집을 수 있어야 규칙이 성립한다
+assert VOTE_BONUS > max(BONUS_BELOW, BONUS_ABOVE)
+
+_WS = re.compile(r"[\s　]+")
+# 번호 뒤에 구분자나 공백이 반드시 있어야 벗긴다.
+# 이게 없으면 '55세 이상 근로자' 가 '세 이상 근로자' 로 잘린다.
+_LEADING_NUM = re.compile(
+    r"^\s*[<\[(【〈]?\s*(?:사진|그림|도면)\s*[0-9①-⑳]+\s*[.)\]>》】]?[\s:·]+"   # 사진 3. / 그림 2
+    r"|^\s*[<\[(【〈]\s*[0-9①-⑳]+\s*[)\]>》】]\s*"                          # (3) / [1]
+    r"|^\s*[0-9]+\s*[.)\]>》】]\s*"                                        # 3.  ← 구분자 필수
+    r"|^\s*[①-⑳]+\s*[.)\]>》】]?\s*"                                      # ①  ← 원문자는 그 자체가 표지
+)
+# 이름이 될 수 없는 글: 자리표시자, 숫자·기호뿐인 글
+_PLACEHOLDER = re.compile(r"^[\s\-–—·ㆍ.,:;/\\()\[\]{}<>~=_]*$")
+_NUMERIC_ONLY = re.compile(r"^[\s0-9①-⑳.,\-–—/()\[\]=~·]*$")
 
 
 def normalize_text(text: str) -> str:
@@ -43,122 +86,261 @@ def clean_caption(text: str, *, strip_numbering: bool = False) -> str:
     return text
 
 
-def _is_photo_cell(cell: Cell, image_of) -> bool:
-    return image_of(cell) is not None
-
-
-def _plausible_caption(cell: Optional[Cell], image_of) -> bool:
-    if cell is None:
+def is_caption_like(text: str) -> bool:
+    """이름이 될 만한 글인가."""
+    text = normalize_text(text)
+    if not text or len(text) > MAX_CAPTION_LEN:
         return False
-    if _is_photo_cell(cell, image_of):
+    if _PLACEHOLDER.match(text) or _NUMERIC_ONLY.match(text):
         return False
-    text = normalize_text(cell.text)
-    if not text or "\n" in cell.text.strip():
-        return False
-    return len(text) <= MAX_CAPTION_LEN
+    return True
 
 
-def _row_header(table: Table, cell: Cell) -> str:
-    """같은 행을 세로로 덮고 있는 맨 왼쪽 열 셀의 글."""
-    best = ""
-    for c in table.cells:
-        if c.col != 0:
-            continue
-        if c.row <= cell.row < c.row_end:
-            text = normalize_text(c.text)
-            if text and len(text) <= MAX_CAPTION_LEN:
-                best = text
-    return best
+# --- 밴드 ------------------------------------------------------------------
+
+@dataclass
+class Band:
+    """행 머리글 하나가 덮는 행 묶음."""
+
+    start: int
+    end: int                 # 포함하지 않는 끝
+    header: str = ""
+
+    def covers(self, row: int) -> bool:
+        return self.start <= row < self.end
 
 
-def _aligned(table: Table, row: int, col: int, col_span: int) -> Optional[Cell]:
-    return table.cell_starting_at(row, col, col_span)
+def find_bands(table: Table, is_photo) -> List[Band]:
+    """맨 왼쪽 열의 머리글 칸으로 표를 가로 묶음으로 나눈다.
 
-
-def resolve_table_captions(table: Table, image_of) -> List[Tuple[Cell, int, str, str, str]]:
-    """표 하나에서 (셀, BinData번호, 캡션, 구역, 출처) 목록을 만든다.
-
-    image_of(cell) 은 그 셀의 배경 이미지 BinData 번호(없으면 None)를 준다.
+    머리글이 없는 표는 표 전체가 하나의 밴드다.
     """
-    photo_cells = []
-    for cell in table.cells:
-        bin_id = image_of(cell)
-        if bin_id is not None:
-            photo_cells.append((cell, bin_id, "background"))
-        for inline_id in cell.inline_bin_ids:
-            photo_cells.append((cell, inline_id, "inline"))
-    if not photo_cells:
-        return []
+    bands = [
+        Band(start=c.row, end=c.row_end, header=normalize_text(c.text))
+        for c in table.cells
+        if c.col == 0 and not is_photo(c) and is_caption_like(c.text)
+    ]
+    if not bands:
+        rows = [c.row for c in table.cells] or [0]
+        ends = [c.row_end for c in table.cells] or [1]
+        return [Band(start=min(rows), end=max(ends))]
+    return sorted(bands, key=lambda b: b.start)
 
-    # 같은 행의 사진들은 캡션 위치(아래/위)가 같을 것이다. 행 단위로 투표한다.
-    rows: Dict[int, List[Cell]] = {}
-    for cell, _bin, _kind in photo_cells:
-        rows.setdefault(cell.row, []).append(cell)
 
-    direction_by_row: Dict[int, str] = {}
-    for row, cells in rows.items():
-        below = sum(
-            1 for c in cells
-            if _plausible_caption(_aligned(table, c.row_end, c.col, c.col_span), image_of)
+def band_for(bands: List[Band], row: int) -> Optional[Band]:
+    for band in bands:
+        if band.covers(row):
+            return band
+    return None
+
+
+# --- 후보 ------------------------------------------------------------------
+
+@dataclass
+class Candidate:
+    cell: Cell
+    text: str
+    source: str              # '아래 칸' 등, 사람에게 보여 줄 말
+    direction: str           # below | above | own | header
+    score: float
+    shareable: bool = False  # 여러 사진이 나눠 쓸 수 있는가 (행 머리글 등)
+    exact: bool = False      # 열 병합 범위가 정확히 같은가
+
+
+def _overlap(a: Cell, b: Cell) -> float:
+    """두 칸의 열 범위가 얼마나 겹치는가 (0-1)."""
+    lo = max(a.col, b.col)
+    hi = min(a.col_end, b.col_end)
+    if hi <= lo:
+        return 0.0
+    return (hi - lo) / max(1, a.col_end - a.col)
+
+
+def _row_has_photo(table: Table, row: int, is_photo) -> bool:
+    return any(c.row == row and is_photo(c) for c in table.cells)
+
+
+def _shape_bonus(text: str) -> float:
+    bonus = 0.0
+    if "\n" not in text:
+        bonus += BONUS_SINGLE_LINE
+    if len(text) <= 20:
+        bonus += BONUS_SHORT
+    if text.rstrip().endswith((":", "：")):
+        bonus += PENALTY_COLON
+    if len(text) == 1:
+        bonus += PENALTY_SINGLE_CHAR
+    return bonus
+
+
+def collect_candidates(table: Table, photo: Cell, bands: List[Band], is_photo) -> List[Candidate]:
+    """사진 칸 하나에 대한 이름 후보들."""
+    out: List[Candidate] = []
+    photo_band = band_for(bands, photo.row)
+
+    own = normalize_text(photo.text)
+    if is_caption_like(own):
+        out.append(Candidate(cell=photo, text=own, source="사진 칸 자체", direction="own",
+                             score=SCORE_OWN_TEXT + _shape_bonus(own), exact=True))
+
+    for row, direction, source, bonus in (
+        (photo.row_end, "below", "아래 칸", BONUS_BELOW),
+        (photo.row - 1, "above", "위 칸", BONUS_ABOVE),
+    ):
+        if row < 0:
+            continue
+        for cell in table.cells:
+            if cell.row != row or is_photo(cell):
+                continue
+            text = normalize_text(cell.text)
+            if not is_caption_like(text):
+                continue
+            ratio = _overlap(photo, cell)
+            if ratio <= 0:
+                continue
+            exact = (cell.col == photo.col and cell.col_span == photo.col_span)
+            base = SCORE_EXACT if exact else SCORE_OVERLAP * ratio
+            score = base + bonus + _shape_bonus(text)
+            cand_band = band_for(bands, cell.row)
+            score += BONUS_SAME_BAND if cand_band is photo_band else PENALTY_OTHER_BAND
+            if not _row_has_photo(table, row, is_photo):
+                score += BONUS_NO_PHOTO_ROW
+            out.append(Candidate(cell=cell, text=text, source=source, direction=direction,
+                                 score=score, exact=exact))
+
+    if photo_band is not None and photo_band.header:
+        header_cell = next(
+            (c for c in table.cells
+             if c.col == 0 and c.row == photo_band.start and not is_photo(c)),
+            None,
         )
-        above = sum(
-            1 for c in cells
-            if _plausible_caption(_aligned(table, c.row - 1, c.col, c.col_span), image_of)
-        )
-        if below >= above and below > 0:
-            direction_by_row[row] = "below"
-        elif above > 0:
-            direction_by_row[row] = "above"
-        else:
-            direction_by_row[row] = "none"
-
-    out = []
-    for cell, bin_id, kind in photo_cells:
-        caption, source = "", ""
-        own = normalize_text(cell.text)
-        if kind == "inline" and own and len(own) <= MAX_CAPTION_LEN:
-            caption, source = own, "같은 칸"
-        if not caption:
-            order = ["below", "above"] if direction_by_row.get(cell.row) != "above" else ["above", "below"]
-            for direction in order:
-                if direction == "below":
-                    cand = _aligned(table, cell.row_end, cell.col, cell.col_span)
-                    label = "아래 칸"
-                else:
-                    cand = _aligned(table, cell.row - 1, cell.col, cell.col_span)
-                    label = "위 칸"
-                if _plausible_caption(cand, image_of):
-                    caption, source = normalize_text(cand.text), label
-                    break
-        if not caption and own and len(own) <= MAX_CAPTION_LEN:
-            caption, source = own, "사진 칸 자체"
-        out.append((cell, bin_id, caption, _row_header(table, cell), source))
+        if header_cell is not None:
+            out.append(Candidate(cell=header_cell, text=photo_band.header, source="행 머리글",
+                                 direction="header",
+                                 score=SCORE_ROW_HEADER + _shape_bonus(photo_band.header),
+                                 shareable=True))
     return out
 
 
-def extract_fields(tables: List[Table]) -> Dict[str, str]:
-    """'도면 명칭' 옆칸에 '대전_026' 이 있는 식의 머리글/값 쌍을 모은다."""
+def vote_directions(photo_cells: List[Cell], candidates: Dict[int, List[Candidate]],
+                    bands: List[Band]) -> Dict[int, str]:
+    """밴드마다 이름이 위에 있는지 아래에 있는지 정한다.
+
+    한쪽에만 '폭이 정확히 같은 칸' 이 있는 사진, 즉 방향이 뻔한 사진만 투표한다.
+    양쪽 다 있는 사진은 기권한다. 그래야 애매한 표가 결과를 흐리지 않는다.
+    """
+    tally: Dict[int, Dict[str, int]] = {}
+    for i, cell in enumerate(photo_cells):
+        band = band_for(bands, cell.row)
+        key = id(band) if band else 0
+        dirs = {c.direction for c in candidates.get(i, []) if c.exact and c.direction in ("below", "above")}
+        if len(dirs) != 1:
+            continue                    # 양쪽 다 있거나 아예 없으면 기권
+        counts = tally.setdefault(key, {"below": 0, "above": 0})
+        counts[next(iter(dirs))] += 1
+
+    out: Dict[int, str] = {}
+    for key, counts in tally.items():
+        if counts["below"] != counts["above"]:
+            out[key] = "below" if counts["below"] > counts["above"] else "above"
+    return out
+
+
+def resolve_table_captions(table: Table, image_of) -> List[Tuple[Cell, int, str, str, str]]:
+    """표 하나에서 (셀, BinData번호, 이름, 구역, 출처) 목록을 만든다."""
+    def is_photo(cell: Cell) -> bool:
+        return image_of(cell) is not None or bool(cell.inline_bin_ids)
+
+    photos: List[Tuple[Cell, int]] = []
+    for cell in table.cells:
+        bin_id = image_of(cell)
+        if bin_id is not None:
+            photos.append((cell, bin_id))
+        for inline_id in cell.inline_bin_ids:
+            photos.append((cell, inline_id))
+    if not photos:
+        return []
+
+    bands = find_bands(table, is_photo)
+    photo_cells = [c for c, _ in photos]
+    candidates = {i: collect_candidates(table, c, bands, is_photo)
+                  for i, c in enumerate(photo_cells)}
+
+    votes = vote_directions(photo_cells, candidates, bands)
+    for i, cell in enumerate(photo_cells):
+        band = band_for(bands, cell.row)
+        winner = votes.get(id(band) if band else 0)
+        if not winner:
+            continue
+        for cand in candidates[i]:
+            if cand.direction == winner:
+                cand.score += VOTE_BONUS
+
+    # 점수 높은 짝부터 확정한다. 쓴 칸은 다른 사진이 쓰지 못한다.
+    pairs = [(cand.score, i, cand)
+             for i, cands in candidates.items() for cand in cands
+             if cand.score >= MIN_ACCEPT]
+    pairs.sort(key=lambda p: (-p[0], p[1]))
+
+    chosen: Dict[int, Candidate] = {}
+    taken = set()
+    for _score, i, cand in pairs:
+        if i in chosen:
+            continue
+        key = (cand.cell.row, cand.cell.col)
+        if key in taken and not cand.shareable:
+            continue
+        chosen[i] = cand
+        if not cand.shareable:
+            taken.add(key)
+
+    out = []
+    for i, (cell, bin_id) in enumerate(photos):
+        cand = chosen.get(i)
+        band = band_for(bands, cell.row)
+        group = band.header if band else ""
+        caption = cand.text if cand else ""
+        source = cand.source if cand else ""
+        if cand is not None and cand.direction == "header":
+            group = ""              # 머리글을 이름으로 썼으면 구역으로 또 쓰지 않는다
+        out.append((cell, bin_id, caption, group, source))
+    return out
+
+
+def extract_fields(tables: List[Table], *, skip_cells=()) -> Dict[str, str]:
+    """'도면 명칭' 옆칸에 '대전_026' 이 있는 식의 머리글/값 쌍을 모은다.
+
+    오른쪽으로 가면서 값을 찾되 **빈 칸을 만나면 멈춘다**. 빈 칸을 건너뛰면
+    옆 항목의 머리글(예: '유적명')을 값으로 집어 오게 된다.
+    '-' 같은 자리표시자만 건너뛴다.
+    """
     fields: Dict[str, str] = {}
+    skip = set(skip_cells)
     for table in tables:
+        by_start = {}
+        for cell in table.cells:
+            by_start.setdefault((cell.row, cell.col), cell)
         for cell in table.cells:
             key = normalize_text(cell.text)
             if not key or len(key) > MAX_CAPTION_LEN or "\n" in cell.text.strip():
                 continue
-            # 오른쪽으로 가면서 첫 번째로 '내용이 있는' 칸을 값으로 삼는다.
-            # 사이에 '-' 나 빈 칸이 끼어 있는 서식이 흔하다.
+            if (table.order, cell.row, cell.col) in skip:
+                continue
             value = ""
             col = cell.col_end
             for _ in range(4):
-                neighbour = next(
-                    (o for o in table.cells if o.row == cell.row and o.col == col), None
-                )
+                neighbour = by_start.get((cell.row, col))
                 if neighbour is None:
                     break
                 text = normalize_text(neighbour.text)
                 col = neighbour.col_end
-                if text and text != "-" and len(text) <= MAX_FIELD_VALUE_LEN:
+                if not text:
+                    break                       # 빈 칸에서 멈춘다
+                if _PLACEHOLDER.match(text):
+                    continue                    # '-' 는 건너뛴다
+                if len(text) <= MAX_FIELD_VALUE_LEN:
                     value = text
-                    break
+                break
             if not value:
                 continue
             fields.setdefault(key, value)
